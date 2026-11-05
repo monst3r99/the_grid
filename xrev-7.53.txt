@@ -1,0 +1,3664 @@
+// ==UserScript==
+// @name         xrev
+// @namespace    http://tampermonkey.net/
+// @version      7.53
+// @description  Compact post columns, left-aligned original posts, native-size profile headers, adjustable columns, and posts opened in a resizable window or an in-page split panel
+// @match        https://x.com/*
+// @match        https://twitter.com/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // Some document-start engines run before the root element exists.
+    if (!document.documentElement) {
+        const startup = new MutationObserver(() => {
+            if (document.documentElement) {
+                startup.disconnect();
+                startXrev();
+            }
+        });
+        startup.observe(document, { childList: true });
+    } else startXrev();
+
+    function startXrev() {
+
+    /*
+     * Marks on X's own elements (cards, headers, galleries, the opened
+     * status) live in a data-xrev attribute, read in CSS as
+     * [data-xrev~="name"], never in class. React rewrites className on
+     * hover (a photo's frame, the post itself), which wiped added classes;
+     * the grid's MutationObserver doesn't watch class, so the layout
+     * flipped until something else re-marked it: photos jittered under
+     * the pointer. React leaves attributes it doesn't manage alone.
+     */
+    function xrevMark(node, name, on) {
+        const marks = (node.getAttribute('data-xrev') || '').split(' ').filter(Boolean);
+        if (marks.includes(name) === Boolean(on)) return;
+        const next = on ? [...marks, name] : marks.filter(mark => mark !== name);
+        if (next.length) node.setAttribute('data-xrev', next.join(' '));
+        else node.removeAttribute('data-xrev');
+    }
+
+    function xrevHas(node, name) {
+        return (' ' + (node.getAttribute('data-xrev') || '') + ' ').includes(' ' + name + ' ');
+    }
+
+    // qb_side is the popup window, qb_side_frame the in-page split panel.
+    const isSidePanel = (window.name === 'qb_side' || window.name === 'qb_side_frame');
+    const css = document.createElement('style');
+
+    // X's small play/pause control. Its full-size click-to-pause surface
+    // shares these labels but must stay absolute, not collapse to a strip.
+    const playbackControl = `:is(
+            [data-testid="videoControlPlayButton"],
+            [data-testid="videoControlPauseButton"],
+            button[aria-label="Play"], button[aria-label="Pause"],
+            [role="button"][aria-label="Play"], [role="button"][aria-label="Pause"],
+            button[aria-label="Play video"], button[aria-label="Pause video"]
+        ):not([class~="absolute"])`;
+
+    // Play/pause protection, in the main page and in the side panel /
+    // popup: narrow players (cards, a 20% panel) slid the timer over play.
+    // xrev settings in localStorage, readable from every branch.
+    const readSetting = (key, fallback) => {
+        try {
+            return localStorage.getItem('xrev-' + key) ?? fallback;
+        } catch (_) {
+            return fallback;
+        }
+    };
+
+    /*
+     * Video controls the toolbar's ▶ menu can switch off, separately for
+     * the side panel / popup ("panel") and timeline cards ("card").
+     * Selectors are relative to the player; a wrapper a control is alone
+     * in goes with it. Labels are X's English aria-labels: only captions
+     * has a test id. Stored as xrev-video-<scope>-<key> = '1' / '0';
+     * everything is on by default except picture-in-picture in cards.
+     */
+    const VIDEO_CONTROLS = [
+        ['play', 'Play / pause', [playbackControl]],
+        ['timer', 'Timer', [
+            `:has(> ${playbackControl}) ~ * > [dir="ltr"]:not(:has(button, [role="button"], input))`
+        ]],
+        ['captions', 'Captions', [
+            '[data-testid="captions"]',
+            ':has(> [data-testid="captions"]:only-child)'
+        ]],
+        ['mute', 'Mute', [
+            ':has(> :is(button[aria-label="Mute"], button[aria-label="Unmute"]))'
+        ]],
+        ['settings', 'Settings', [
+            'button[aria-label="Video Settings"]',
+            ':has(> button[aria-label="Video Settings"]:only-child)'
+        ]],
+        ['pip', 'Picture-in-picture', [
+            'button[aria-label="Picture-in-Picture"]',
+            ':has(> button[aria-label="Picture-in-Picture"]:only-child)'
+        ]],
+        ['fullscreen', 'Full screen', [
+            ':is(button[aria-label="Full screen"], button[aria-label="Exit full screen"])',
+            ':has(> :is(button[aria-label="Full screen"], button[aria-label="Exit full screen"]):only-child)'
+        ]]
+    ];
+    const VIDEO_SCOPES = [['panel', 'Panel'], ['card', 'Cards']];
+    const videoControlOn = (scope, key) => readSetting(
+        `video-${scope}-${key}`,
+        scope === 'card' && key === 'pip' ? '0' : '1'
+    ) === '1';
+
+    function hiddenControlsCss(scope, prefix) {
+        return VIDEO_CONTROLS.map(([key, , parts]) => parts.map(part =>
+            `html.xrev-hide-${scope}-${key} ${prefix}[data-testid="videoPlayer"] ${part}`
+        ).join(',\n') + ' { display: none !important; }').join('\n');
+    }
+
+    function applyVideoControlClasses(root, scope) {
+        for (const [key] of VIDEO_CONTROLS) {
+            root.classList.toggle(`xrev-hide-${scope}-${key}`, !videoControlOn(scope, key));
+        }
+    }
+
+    const playbackCss = `
+        /* Keep playback controls above quoted-post links and adjacent
+         * controls, with a fixed hit area even in narrow video players. */
+        [data-testid="videoPlayer"] ${playbackControl} {
+            position: relative !important;
+            z-index: 10 !important;
+            pointer-events: auto !important;
+            flex: 0 0 32px !important;
+            min-width: 32px !important;
+            min-height: 32px !important;
+            touch-action: manipulation !important;
+        }
+
+        /* X rounds the button fully and browsers hit-test that rounded shape,
+         * so the corners of its square clicked through to the row behind. */
+        [data-testid="videoPlayer"] ${playbackControl}::after {
+            content: "" !important;
+            position: absolute !important;
+            inset: 0 !important;
+        }
+
+        /* X keeps the timer-and-buttons group at full width and lets the
+         * play/pause side shrink to nothing, so narrow cards slide the timer
+         * over the button. Invert that: play/pause never shrinks, the timer
+         * gives up its width first, then extra buttons overflow rightwards. */
+        [data-testid="videoPlayer"] :has(> ${playbackControl}) {
+            flex-shrink: 0 !important;
+        }
+
+        [data-testid="videoPlayer"] :has(> ${playbackControl}) ~ * {
+            flex-shrink: 1 !important;
+            min-width: 0 !important;
+        }
+
+        [data-testid="videoPlayer"] :has(> ${playbackControl}) ~ * > :not(:has(button, [role="button"], input)) {
+            flex-shrink: 1 !important;
+            min-width: 0 !important;
+            overflow: hidden !important;
+        }
+
+        /*
+         * Where the timer ("0:06 / 1:30", X's 13px) can't fit at full
+         * size, its text gets smaller. Earlier versions guessed the room
+         * from fixed button widths and hid the timer when the guess was
+         * short, though 20-40px were free. Now the timer takes exactly the
+         * room left: the play/pause group stops growing, the right-hand
+         * group fills the row, and in it the timer (X's [dir=ltr] div,
+         * first in the group) takes what the buttons leave. The timer is
+         * its own size container, and its text is sized to that width.
+         *
+         * X shows two formats: the time left while playing in a timeline
+         * ("0:08", about 2.6em) and "elapsed / total" otherwise
+         * ("0:05 / 0:13", about 5.2em). CSS can't read which, so the long
+         * one is the default and markTimerFormat() flags the short one.
+         * Never hidden: below 7px the long one ends in an ellipsis, which
+         * still shows the elapsed time.
+         */
+        [data-testid="videoPlayer"] :has(> ${playbackControl}) {
+            flex-grow: 0 !important;
+        }
+
+        [data-testid="videoPlayer"] :has(> ${playbackControl}) ~ * {
+            flex: 1 1 0 !important;
+        }
+
+        [data-testid="videoPlayer"] :has(> ${playbackControl}) ~ * > [dir="ltr"]:not(:has(button, [role="button"], input)) {
+            flex: 1 1 0 !important;
+            min-width: 0 !important;
+            container: xrev-timer / inline-size !important;
+            text-align: start !important;
+        }
+
+        [data-testid="videoPlayer"] :has(> ${playbackControl}) ~ * > [dir="ltr"]:not(:has(button, [role="button"], input)) > * {
+            font-size: clamp(7px, calc(100cqw / 5.2), 13px) !important;
+        }
+
+        [data-testid="videoPlayer"] :has(> ${playbackControl}) ~ * > [dir="ltr"][data-xrev-short-timer]:not(:has(button, [role="button"], input)) > * {
+            font-size: clamp(7px, calc(100cqw / 2.6), 13px) !important;
+        }
+
+        /*
+         * A long timer with under ~46px (a narrow panel with a captions
+         * button) fell to 7px and still ended "0...", and stacking X's own
+         * text (7.50) broke it over three lines ("0:0", "/", "0:1"). The
+         * stacked form is drawn from copies of the two times instead,
+         * without the slash: elapsed over total, each line scaled to the
+         * width (a time like "0:05" is about 2.3em, "12:34" about 2.8em),
+         * so it fits down to ~14px. Below 14px there is no room even for
+         * that, and the timer is left out. markTimerFormat() writes the
+         * copies onto X's span (data-xrev-elapsed / -total, and
+         * data-xrev-wide for 5+ characters); until it has, X's text shows.
+         */
+        @container xrev-timer (max-width: 46px) {
+            [data-testid="videoPlayer"] :has(> ${playbackControl}) ~ * > [dir="ltr"]:not(:has(button, [role="button"], input)) > [data-xrev-elapsed] {
+                display: block !important;
+                font-size: 0 !important;
+                line-height: 0 !important;
+                white-space: nowrap !important;
+            }
+
+            [data-testid="videoPlayer"] :has(> ${playbackControl}) ~ * > [dir="ltr"]:not(:has(button, [role="button"], input)) > [data-xrev-elapsed]::before,
+            [data-testid="videoPlayer"] :has(> ${playbackControl}) ~ * > [dir="ltr"]:not(:has(button, [role="button"], input)) > [data-xrev-elapsed]::after {
+                display: block !important;
+                font-size: clamp(6px, calc(100cqw / 2.3), 12px) !important;
+                line-height: 1.05 !important;
+                white-space: nowrap !important;
+                overflow: hidden !important;
+            }
+
+            [data-testid="videoPlayer"] :has(> ${playbackControl}) ~ * > [dir="ltr"]:not(:has(button, [role="button"], input)) > [data-xrev-wide]::before,
+            [data-testid="videoPlayer"] :has(> ${playbackControl}) ~ * > [dir="ltr"]:not(:has(button, [role="button"], input)) > [data-xrev-wide]::after {
+                font-size: clamp(6px, calc(100cqw / 2.8), 12px) !important;
+            }
+
+            [data-testid="videoPlayer"] :has(> ${playbackControl}) ~ * > [dir="ltr"]:not(:has(button, [role="button"], input)) > [data-xrev-elapsed]::before {
+                content: attr(data-xrev-elapsed) !important;
+            }
+
+            [data-testid="videoPlayer"] :has(> ${playbackControl}) ~ * > [dir="ltr"]:not(:has(button, [role="button"], input)) > [data-xrev-elapsed]::after {
+                content: attr(data-xrev-total) !important;
+            }
+        }
+
+        @container xrev-timer (max-width: 13px) {
+            [data-testid="videoPlayer"] :has(> ${playbackControl}) ~ * > [dir="ltr"]:not(:has(button, [role="button"], input)) > * {
+                visibility: hidden !important;
+            }
+        }
+
+        /*
+         * Narrow full bars (a 20% side panel): X's six 32px+ controls left
+         * the timer a few pixels ("0..."). markTimerFormat() tags a player
+         * narrower than 388px with data-xrev-bar="compact" (controls like
+         * cards: play 26px, the rest 24px with 16px icons) and below 218px
+         * "tiny" (picture-in-picture goes too). A @container query on the
+         * control row did this in 7.49-7.50 and worked in tests, but not
+         * in the user's real panel, so it's measured in JS. The tag sits on
+         * the player, which X keeps while it remounts the bar on hover.
+         */
+        [data-testid="videoPlayer"][data-xrev-bar] ${playbackControl} {
+            flex: 0 0 26px !important;
+            min-width: 26px !important;
+            width: 26px !important;
+            min-height: 26px !important;
+            height: 26px !important;
+            padding: 0 !important;
+        }
+
+        [data-testid="videoPlayer"][data-xrev-bar] :has(> ${playbackControl}) ~ * :is(button, [role="button"]) {
+            min-width: 24px !important;
+            width: 24px !important;
+            min-height: 24px !important;
+            height: 24px !important;
+            padding: 0 !important;
+        }
+
+        [data-testid="videoPlayer"][data-xrev-bar] :is(${playbackControl}, :has(> ${playbackControl}) ~ * :is(button, [role="button"])) svg {
+            width: 16px !important;
+            height: 16px !important;
+        }
+
+        [data-testid="videoPlayer"][data-xrev-bar] :has(> ${playbackControl}) ~ * > [dir="ltr"]:not(:has(button, [role="button"], input)) {
+            margin-left: 2px !important;
+            margin-right: 2px !important;
+        }
+
+        [data-testid="videoPlayer"][data-xrev-bar="tiny"] :is(
+            button[aria-label="Picture-in-Picture"],
+            :has(> button[aria-label="Picture-in-Picture"]:only-child)
+        ) {
+            display: none !important;
+        }
+
+        /* Controls switched off in the toolbar's ▶ menu (side panel and
+         * popup; html.xrev-hide-panel-* is set on their documents). */
+        ${hiddenControlsCss('panel', '')}
+    `;
+
+    /*
+     * Tags video players for playbackCss and the card rules:
+     *  - data-xrev-bar: "compact" under 388px wide, "tiny" under 218px;
+     *  - data-xrev-cc-room: 170px or wider, enough for the captions
+     *    button in a card (cards show it, and captions, only then);
+     *  - data-xrev-short-timer on a timer showing one time ("0:08").
+     * The player is measured on each playback event and pointer movement
+     * over it (X shows the bar on hover), the timer text again shortly
+     * after X has re-rendered it. A timer not yet checked is sized as the
+     * long format: smaller, never cut off. Runs in the main page, the
+     * popup and the panel's written document.
+     */
+    const TIMER_TEXT = /^\d+(?::\d\d)+(?: \/ \d+(?::\d\d)+)?$/;
+    function markTimerFormat(doc) {
+        const pending = new WeakSet();
+        const setAttr = (el, name, value) => {
+            if (value == null) {
+                if (el.hasAttribute(name)) el.removeAttribute(name);
+            } else if (el.getAttribute(name) !== value) el.setAttribute(name, value);
+        };
+        const sizePlayer = player => {
+            const width = player.getBoundingClientRect().width;
+            if (!width) return;
+            setAttr(player, 'data-xrev-bar', width < 218 ? 'tiny' : width < 388 ? 'compact' : null);
+            setAttr(player, 'data-xrev-cc-room', width >= 170 ? '' : null);
+        };
+        const check = player => {
+            sizePlayer(player);
+            for (const el of player.querySelectorAll('div[dir="ltr"]')) {
+                const text = el.textContent.trim();
+                if (!TIMER_TEXT.test(text)) continue;
+                const short = !text.includes('/');
+                if (el.hasAttribute('data-xrev-short-timer') !== short) {
+                    el.toggleAttribute('data-xrev-short-timer', short);
+                }
+                // The stacked form's two lines, without the slash.
+                const span = el.firstElementChild;
+                if (!span) continue;
+                const [elapsed, total] = short ? [] : text.split(/\s*\/\s*/);
+                setAttr(span, 'data-xrev-elapsed', short ? null : elapsed);
+                setAttr(span, 'data-xrev-total', short ? null : total);
+                setAttr(span, 'data-xrev-wide',
+                    !short && Math.max(elapsed.length, total.length) >= 5 ? '' : null);
+            }
+        };
+        const onEvent = e => {
+            const player = e.target instanceof Element &&
+                e.target.closest('[data-testid="videoPlayer"]');
+            if (!player || pending.has(player)) return;
+            // The bar is drawn compact from its first frame.
+            sizePlayer(player);
+            pending.add(player);
+            // After X has rendered the change this event causes.
+            setTimeout(() => {
+                pending.delete(player);
+                check(player);
+            }, 60);
+        };
+        for (const type of ['timeupdate', 'play', 'pause', 'ended', 'seeked',
+            'loadedmetadata', 'pointerover', 'pointermove']) {
+            doc.addEventListener(type, onEvent, true);
+        }
+    }
+
+    /*
+     * Tab bars (a profile's Posts / Replies / Media...), in the main page and
+     * in the side panel. X sizes each tab by its label, and the selected one
+     * turns bold, so every switch slid the other tabs sideways: equal widths
+     * keep each label in place. Selecting Posts or Media (then "Videos") also
+     * adds a ⌄ menu arrow beside the label, which pushed that label aside by
+     * half the arrow's width: the arrow is taken out of the layout and hangs
+     * to the right of a label that stays centred. Where X puts the arrow is
+     * unknown (inside the label, beside it, or in its own wrapper), so each
+     * case is covered. Only link tabs with a text label are touched.
+     */
+    const tabCss = scope => `
+            ${scope} [data-testid="primaryColumn"] [role="tablist"] > * {
+                flex: 1 1 0 !important;
+                min-width: max-content !important;
+            }
+
+            ${scope} [data-testid="primaryColumn"] a[role="tab"]:has(span) svg {
+                position: absolute !important;
+                left: 100% !important;
+                top: 50% !important;
+                transform: translateY(-50%) !important;
+                margin-left: 2px !important;
+            }
+
+            ${scope} [data-testid="primaryColumn"] a[role="tab"]:has(span) div:has(> svg):not(:has(span)) {
+                flex: 0 0 0px !important;
+                width: 0 !important;
+                min-width: 0 !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                overflow: visible !important;
+            }
+        `;
+
+    // Shared by the popup window and the split panel, whose page the main
+    // window writes itself (see openPanel).
+    const sidePanelCss = `
+            header[role="banner"] { display: none !important; }
+            [data-testid="sidebarColumn"] { display: none !important; }
+            /* Not the profile's Posts / Replies / Media tab bar, also a nav. */
+            nav[role="navigation"]:not(:has([role="tab"])) { display: none !important; }
+            [data-testid="ScrollSnap-SwipeGuard"] { display: none !important; }
+            a[data-testid="SideNav_NewTweet_Button"] { display: none !important; }
+            [data-testid="primaryColumn"] {
+                max-width: 100% !important;
+                width: 100% !important;
+                border: none !important;
+                margin: 0 !important;
+            }
+            main[role="main"] > div > div { max-width: 100% !important; }
+            [data-testid="primaryColumn"] aside { display: none !important; }
+
+            ${tabCss('')}
+
+            ${playbackCss}
+
+            /* Shrink three-dot menu hit area */
+            [data-testid="caret"] {
+                max-width: 36px !important;
+                max-height: 36px !important;
+                overflow: hidden !important;
+            }
+        `;
+
+    // --- SIDE PANEL WINDOW ---
+    if (isSidePanel) {
+        // In the split panel this runs on the /robots.txt placeholder,
+        // which the main window then replaces; only the popup needs it.
+        css.textContent = sidePanelCss;
+        document.documentElement.appendChild(css);
+        markTimerFormat(document);
+        // The ▶ menu's panel settings; the main window changes them.
+        applyVideoControlClasses(document.documentElement, 'panel');
+        window.addEventListener('storage', e => {
+            if (e.key?.startsWith('xrev-video-')) applyVideoControlClasses(document.documentElement, 'panel');
+        });
+
+        // Listen for close command from parent
+        window.addEventListener('message', function (e) {
+            if (e.source === window.opener && /^https:\/\/(x|twitter)\.com$/.test(e.origin) && e.data === 'xrew_close') window.close();
+        });
+
+        return;
+    }
+
+    // --- MAIN WINDOW ---
+
+    /*
+     * Two installed copies of xrev (say, an older version left enabled)
+     * each pack the same cards with their own column count and each open
+     * every clicked post in their own panel. Run once, and say why.
+     * Older versions set no marker, but their stylesheet is already in.
+     */
+    if (window.__xrevRunning || [...document.querySelectorAll('style')].some(
+        style => style.textContent.includes('#xrev-toolbar')
+    )) {
+        showDuplicateWarning();
+        return;
+    }
+    window.__xrevRunning = true;
+    markTimerFormat(document);
+
+    /*
+     * X's full-size photo viewer is a route of its own
+     * (/<handle>/status/<id>/photo/1) drawn over the page it came from.
+     * The layout keeps reading the page underneath, so opening a photo
+     * from home doesn't repack the timeline as a status page behind it.
+     */
+    const MEDIA_ROUTE = /\/status\/\d+\/(?:photo|video)\/\d+\/?$/;
+    let pagePathname = location.pathname;
+    let pageSearch = location.search;
+    function pagePath() {
+        if (!MEDIA_ROUTE.test(location.pathname)) {
+            pagePathname = location.pathname;
+            pageSearch = location.search;
+        }
+        return pagePathname;
+    }
+
+    css.textContent = `
+        /* Nav icon-only */
+        header[role="banner"] nav a > div > div:not(:first-child),
+        header[role="banner"] [data-testid="AppTabBar_More_Menu"] > div > div:not(:first-child) {
+            display: none !important;
+        }
+
+        header[role="banner"] nav a > div {
+            width: auto !important;
+            padding: 8px !important;
+            display: inline-flex !important;
+        }
+
+        header[role="banner"] [data-testid="AppTabBar_More_Menu"] > div {
+            width: auto !important;
+            padding: 8px !important;
+            display: inline-flex !important;
+        }
+
+        header[role="banner"] nav a {
+            width: auto !important;
+            display: inline-flex !important;
+        }
+
+        header[role="banner"] a[data-testid="SideNav_NewTweet_Button"] {
+            width: 50px !important;
+            height: 50px !important;
+            min-width: 50px !important;
+            border-radius: 50% !important;
+            padding: 0 !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+        }
+
+        header[role="banner"] a[data-testid="SideNav_NewTweet_Button"] > div > span {
+            display: none !important;
+        }
+
+        [data-testid="SideNav_AccountSwitcher_Button"] {
+            display: none !important;
+        }
+
+        nav [href="/i/premium_sign_up"],
+        nav [href="/i/verified-choose"],
+        nav a[aria-label*="remium"],
+        nav a[aria-label*="erified"],
+        nav a[href="/i/grok"] {
+            display: none !important;
+        }
+
+        [data-testid="sidebarColumn"] {
+            display: none !important;
+        }
+
+        [data-testid="primaryColumn"] a[href*="premium_sign_up"],
+        [data-testid="primaryColumn"] a[href*="verified-choose"] {
+            display: none !important;
+        }
+
+        /* Shrink three-dot menu hit area */
+        [data-testid="caret"] {
+            max-width: 36px !important;
+            max-height: 36px !important;
+            overflow: hidden !important;
+        }
+
+        #qb-ghost-link {
+            position: fixed;
+            width: 1px;
+            height: 1px;
+            opacity: 0;
+            pointer-events: none;
+            z-index: -1;
+        }
+    `;
+    document.documentElement.appendChild(css);
+
+    // --- xrev: native-card masonry. No cloning or moving React-owned nodes. ---
+    const gridStore = {
+        get(key, fallback) {
+            try {
+                return localStorage.getItem('xrev-' + key) ?? fallback;
+            } catch (_) {
+                return fallback;
+            }
+        },
+
+        set(key, value) {
+            try {
+                localStorage.setItem('xrev-' + key, String(value));
+            } catch (_) {}
+        }
+    };
+
+    let gridEnabled = gridStore.get('enabled', '1') === '1';
+    // Where a clicked post opens: 'popup' (a separate window beside the
+    // browser) or 'split' (the right part of this page, empty until used).
+    let openMode = gridStore.get('open-mode', 'popup') === 'split' ? 'split' : 'popup';
+
+    // Each mode keeps its own column count: five columns chosen for the
+    // full width are unreadable in half of it. Popup keeps the old keys.
+    const columnKey = name => (openMode === 'split' ? 'split-' : '') + name;
+    let gridColumns;
+    let manualColumns;
+    let displayedColumns;
+    const loadColumnSettings = () => {
+        gridColumns = Math.max(
+            1,
+            Math.min(8, parseInt(gridStore.get(columnKey('columns'), '3'), 10) || 3)
+        );
+        manualColumns = gridStore.get(columnKey('manual-columns'), '0') === '1';
+        displayedColumns = gridColumns;
+    };
+    loadColumnSettings();
+
+    // Width of that window or panel, in percent of the screen / page.
+    const PANEL_WIDTH_DEFAULT = { popup: 40, split: 50 };
+    const clampPanelWidth = value => Math.max(20, Math.min(80, value));
+    const panelWidths = {};
+    for (const mode of ['popup', 'split']) {
+        panelWidths[mode] = clampPanelWidth(
+            parseFloat(gridStore.get(mode + '-width', PANEL_WIDTH_DEFAULT[mode])) ||
+            PANEL_WIDTH_DEFAULT[mode]
+        );
+    }
+
+    // A minimised split panel hides (the timeline takes the full width)
+    // but keeps its post; \ brings it back.
+    let panelMinimised = gridStore.get('panel-min', '0') === '1';
+    // A minimised toolbar shrinks to its small ‹ button.
+    let toolbarMinimised = gridStore.get('toolbar-min', '0') === '1';
+
+    // Activate the timeline layout before X mounts.
+    document.documentElement.classList.toggle('xrev-grid', gridEnabled);
+    document.documentElement.classList.toggle('xrev-split', openMode === 'split');
+    document.documentElement.classList.toggle('xrev-panel-min', panelMinimised);
+    applyVideoControlClasses(document.documentElement, 'card');
+
+    // Kept in its own sheet: X owns the root element's inline style.
+    const splitStyle = document.createElement('style');
+    const applySplitWidth = () => {
+        splitStyle.textContent = `:root { --xrev-split: ${panelWidths.split / 100}; }`;
+    };
+    applySplitWidth();
+    document.documentElement.appendChild(splitStyle);
+
+    const gridStyle = document.createElement('style');
+
+    gridStyle.textContent = `
+        html.xrev-grid {
+            overflow-anchor: none !important;
+            overflow-y: scroll !important;
+        }
+
+        html.xrev-grid [data-testid="primaryColumn"],
+        html.xrev-grid [data-testid="primaryColumn"] * {
+            overflow-anchor: none !important;
+        }
+
+        html.xrev-grid header[role="banner"] {
+            position: fixed !important;
+            left: 0 !important;
+            top: 0 !important;
+            bottom: 0 !important;
+        }
+
+        html.xrev-grid main[role="main"] {
+            flex: 0 0 auto !important;
+            min-width: 0 !important;
+            width: calc(100% - 68px) !important;
+            max-width: none !important;
+            margin-left: 68px !important;
+            margin-right: 0 !important;
+            align-self: stretch !important;
+        }
+
+        /* Split mode: the timeline keeps the left part, the post panel
+         * (position: fixed) the right part. */
+        html.xrev-grid.xrev-split:not(.xrev-panel-min) main[role="main"] {
+            width: calc(100% * (1 - var(--xrev-split, .5)) - 68px) !important;
+        }
+
+        html.xrev-grid main[role="main"] > div,
+        html.xrev-grid main[role="main"] > div > div {
+            width: 100% !important;
+            max-width: none !important;
+        }
+
+        html.xrev-grid [data-testid="primaryColumn"] {
+            width: 100% !important;
+            max-width: none !important;
+            min-width: 0 !important;
+            margin-left: 0 !important;
+            margin-right: 0 !important;
+            transform: none !important;
+            flex-shrink: 0 !important;
+            box-sizing: border-box !important;
+        }
+
+        /* Empty rail wrappers must never intercept clicks on the timeline. */
+        header[role="banner"],
+        header[role="banner"] * {
+            pointer-events: none !important;
+        }
+
+        header[role="banner"] {
+            width: 68px !important;
+            min-width: 68px !important;
+            max-width: 68px !important;
+            flex: 0 0 68px !important;
+        }
+
+        header[role="banner"] a,
+        header[role="banner"] button,
+        header[role="banner"] [role="button"] {
+            pointer-events: auto !important;
+            width: 48px !important;
+            min-width: 48px !important;
+            max-width: 48px !important;
+            height: 48px !important;
+            min-height: 48px !important;
+            max-height: 48px !important;
+            flex: 0 0 48px !important;
+            padding: 0 !important;
+            margin: 2px 8px !important;
+            display: flex;
+            align-items: center !important;
+            justify-content: center !important;
+            box-sizing: border-box !important;
+            overflow: hidden !important;
+            clip-path: inset(0 round 50%) !important;
+        }
+
+        header[role="banner"] a[data-testid="SideNav_NewTweet_Button"] {
+            width: 48px !important;
+            min-width: 48px !important;
+            height: 48px !important;
+        }
+
+        header[role="banner"] [role="menu"],
+        header[role="banner"] [role="menu"] *,
+        header[role="banner"] [role="dialog"],
+        header[role="banner"] [role="dialog"] * {
+            pointer-events: auto !important;
+        }
+
+        /*
+         * X also constrains intermediate timeline wrappers. Widen the
+         * entire ancestor path, never the descendants inside a post.
+         * Switching a profile tab empties the timeline while it loads, or
+         * for good on an empty tab: the spinner and the tab bar keep the
+         * same path wide, or the page snapped to X's narrow column.
+         */
+        html.xrev-grid [data-xrev~="xrev-stretch"],
+        html.xrev-grid [data-testid="primaryColumn"] :is(div, section):has(
+            [data-testid="cellInnerDiv"], [role="progressbar"], [role="tablist"]
+        ):not(article):not(article *):not([data-xrev~="xrev-content"]):not([data-xrev~="xrev-content"] *):not([role="dialog"] *) {
+            width: 100% !important;
+            max-width: none !important;
+            min-width: 0 !important;
+            margin-left: 0 !important;
+            margin-right: 0 !important;
+            align-self: stretch !important;
+            box-sizing: border-box !important;
+            flex-shrink: 0 !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-feed"] {
+            /*
+             * Keep X's native total height, padding, spacers and cell positions.
+             */
+            overflow: visible !important;
+            box-sizing: border-box !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-feed"] > [data-xrev~="xrev-cell"] {
+            /*
+             * X measures these real slots, so its virtualizer learns the packed
+             * height instead of expecting the old single-column scroll range.
+             */
+            height: var(--xrev-slot) !important;
+            min-height: var(--xrev-slot) !important;
+            max-height: var(--xrev-slot) !important;
+            overflow: visible !important;
+            pointer-events: none !important;
+            box-sizing: border-box !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-cell"] > [data-xrev~="xrev-content"] {
+            container-type: inline-size;
+            container-name: xrev-card;
+            width: var(--xrev-card-width) !important;
+            max-width: none !important;
+            min-width: 0 !important;
+            height: auto !important;
+            max-height: none !important;
+            position: relative !important;
+            left: 0 !important;
+            top: 0 !important;
+            transform: translate(
+                var(--xrev-x, 8px),
+                var(--xrev-y, 0px)
+            ) !important;
+            pointer-events: auto !important;
+            box-sizing: border-box !important;
+            border: 1px solid rgba(128, 128, 128, .28) !important;
+            border-radius: 14px !important;
+            overflow: hidden !important;
+        }
+
+        html.xrev-grid body [data-xrev~="xrev-feed"] > [data-xrev~="xrev-cell"] > [data-xrev~="xrev-content"] {
+            width: var(--xrev-local-width) !important;
+            min-width: 0 !important;
+            max-width: var(--xrev-local-width) !important;
+            contain: paint !important;
+            overflow: clip !important;
+        }
+
+        /*
+         * Media can retain a pixel width from its previous column. Constrain
+         * its wrappers as well as the image, and clip at the card boundary.
+         */
+        html.xrev-grid [data-xrev~="xrev-content"] :is(
+            [data-testid="tweetPhoto"],
+            [data-testid="videoPlayer"],
+            [data-testid="card.wrapper"],
+            [data-testid="tweetText"]
+        ),
+        html.xrev-grid [data-xrev~="xrev-content"] div:has([data-testid="tweetPhoto"], [data-testid="videoPlayer"]) {
+            min-width: 0 !important;
+            max-width: 100% !important;
+            box-sizing: border-box !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] [data-testid="tweetPhoto"] img,
+        html.xrev-grid [data-xrev~="xrev-content"] video {
+            max-width: 100% !important;
+            box-sizing: border-box !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] [data-testid="tweetPhoto"],
+        html.xrev-grid [data-xrev~="xrev-content"] [data-testid="videoPlayer"] {
+            overflow: hidden !important;
+        }
+
+        /*
+         * Quoted posts are usually role=link flex items, not articles. Their
+         * intrinsic minimum width can keep the whole media subtree oversized.
+         */
+        html.xrev-grid [data-xrev~="xrev-content"] :is(
+            [role="link"],
+            [data-testid="quoteTweet"]
+        ):has(
+            [data-testid="tweetPhoto"],
+            [data-testid="videoPlayer"]
+        ) {
+            width: 100% !important;
+            min-width: 0 !important;
+            max-width: 100% !important;
+            flex-shrink: 1 !important;
+            box-sizing: border-box !important;
+            overflow: hidden !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] :is(
+            [role="link"],
+            [data-testid="quoteTweet"]
+        ) :is(a, div):has(
+            [data-testid="tweetPhoto"],
+            [data-testid="videoPlayer"]
+        ) {
+            min-width: 0 !important;
+            max-width: 100% !important;
+            flex-shrink: 1 !important;
+            box-sizing: border-box !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] :is(
+            [role="link"],
+            [data-testid="quoteTweet"]
+        ) [data-testid="tweetPhoto"] img:not([data-testid="videoPlayer"] img) {
+            width: 100% !important;
+            min-width: 0 !important;
+            max-width: 100% !important;
+            object-fit: contain !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] :is(
+            [role="link"],
+            [data-testid="quoteTweet"]
+        ) [data-testid="tweetPhoto"] [style*="background-image"] {
+            background-size: contain !important;
+            background-repeat: no-repeat !important;
+            background-position: center !important;
+        }
+
+        /*
+         * Post body under the avatar (findSpanMarks): avatar column and
+         * body share one grid cell. The body keeps its own flex column and
+         * padding and runs the full card width; its first child (the name
+         * header) is padded clear of the avatar, which sits on top.
+         */
+        html.xrev-grid [data-xrev~="xrev-content"] [data-xrev~="xrev-span-row"] {
+            display: grid !important;
+            grid-template-columns: minmax(0, 1fr) !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] [data-xrev~="xrev-span-row"] > :is([data-xrev~="xrev-span-avatar"], [data-xrev~="xrev-span-body"]) {
+            grid-area: 1 / 1 !important;
+            min-width: 0 !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] [data-xrev~="xrev-span-row"] > [data-xrev~="xrev-span-avatar"] {
+            align-self: start !important;
+            justify-self: start !important;
+            position: relative !important;
+            z-index: 1 !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] [data-xrev~="xrev-span-body"] > :first-child {
+            padding-left: 48px !important;
+            min-height: 40px !important;
+            box-sizing: border-box !important;
+        }
+
+        /*
+         * Multi-photo galleries need their own layout, not width:100% on
+         * every native half-width tile. Flatten only the gallery wrappers.
+         */
+        html.xrev-grid [data-xrev~="xrev-content"] [data-xrev~="xrev-gallery"] {
+            display: grid !important;
+            grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+            gap: 2px !important;
+            width: 100% !important;
+            min-width: 0 !important;
+            max-width: 100% !important;
+            height: auto !important;
+            min-height: 0 !important;
+            max-height: none !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            position: relative !important;
+            inset: auto !important;
+            transform: none !important;
+            overflow: hidden !important;
+            box-sizing: border-box !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] [data-xrev~="xrev-gallery"] [data-testid="ScrollSnap-prevButtonWrapper"],
+        html.xrev-grid [data-xrev~="xrev-content"] [data-xrev~="xrev-gallery"] [data-testid="ScrollSnap-nextButtonWrapper"] {
+            display: none !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] [data-xrev~="xrev-gallery-pass"] {
+            display: contents !important;
+        }
+
+        /*
+         * Only photo tiles take a grid cell. With the wrappers flattened,
+         * anything else X keeps or mounts inside them (aspect spacers, a
+         * hover layer, carousel arrows) became a grid item of its own and
+         * opened a new row: hovering a multi-photo post grew it by ~20px
+         * until the pointer left. Anything holding a photo is kept, in case
+         * X adds a wrapper before the marks catch up.
+         */
+        html.xrev-grid [data-xrev~="xrev-content"] [data-xrev~="xrev-gallery"] > :not([data-xrev~="xrev-gallery-pass"], [data-xrev~="xrev-gallery-tile"], [data-testid="tweetPhoto"], :has([data-testid="tweetPhoto"])),
+        html.xrev-grid [data-xrev~="xrev-content"] [data-xrev~="xrev-gallery"] [data-xrev~="xrev-gallery-pass"] > :not([data-xrev~="xrev-gallery-pass"], [data-xrev~="xrev-gallery-tile"], [data-testid="tweetPhoto"], :has([data-testid="tweetPhoto"])) {
+            display: none !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] [data-xrev~="xrev-gallery"] [data-xrev~="xrev-gallery-tile"] {
+            display: block !important;
+            position: relative !important;
+            inset: auto !important;
+            transform: none !important;
+            width: 100% !important;
+            min-width: 0 !important;
+            max-width: 100% !important;
+            height: auto !important;
+            min-height: 0 !important;
+            max-height: none !important;
+            aspect-ratio: 1 !important;
+            padding: 0 !important;
+            margin: 0 !important;
+            overflow: hidden !important;
+            box-sizing: border-box !important;
+        }
+
+        /*
+         * A post can mix a video with photos, and X wraps the video in
+         * tweetPhoto as well. Its player is stacked, absolutely positioned
+         * layers sized by a padding-bottom aspect box: the photo-tile
+         * flattening below (static divs, no padding, images stretched to
+         * the tile) took it apart. A video tile keeps X's own player, sized
+         * by its aspect box like a standalone video, and the photo rules
+         * skip it.
+         */
+        html.xrev-grid [data-xrev~="xrev-content"] [data-xrev~="xrev-gallery"] [data-xrev~="xrev-gallery-tile"]:has([data-testid="videoPlayer"]) {
+            aspect-ratio: auto !important;
+            align-self: center !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] [data-xrev~="xrev-gallery-tile"]:not(:has([data-testid="videoPlayer"])) div {
+            position: static !important;
+            transform: none !important;
+            width: 100% !important;
+            min-width: 0 !important;
+            max-width: 100% !important;
+            height: auto !important;
+            min-height: 0 !important;
+            padding: 0 !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] [data-xrev~="xrev-gallery-tile"]:not(:has([data-testid="videoPlayer"])) img {
+            position: absolute !important;
+            inset: 0 !important;
+            width: 100% !important;
+            height: 100% !important;
+            min-width: 0 !important;
+            min-height: 0 !important;
+            max-width: 100% !important;
+            max-height: 100% !important;
+            object-fit: contain !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] [data-xrev~="xrev-gallery-tile"]:not(:has([data-testid="videoPlayer"])) [style*="background-image"] {
+            position: absolute !important;
+            inset: 0 !important;
+            height: 100% !important;
+            background-size: contain !important;
+            background-position: center !important;
+            background-repeat: no-repeat !important;
+        }
+
+        /* The timeline is wide for replies, but the original status must
+         * retain X's normal reading/media width inside that wide container. */
+        html.xrev-grid [data-testid="primaryColumn"] article[data-xrev~="xrev-original-status"] {
+            width: 600px !important;
+            max-width: 100% !important;
+            min-width: 0 !important;
+            margin-left: 0 !important;
+            margin-right: auto !important;
+            align-self: flex-start !important;
+            box-sizing: border-box !important;
+        }
+
+        ${tabCss('html.xrev-grid')}
+
+        /* Keep tweet actions on one compact line, including their counts.
+         * Only the tweet action row is affected, never polls or media controls. */
+        html.xrev-grid [data-xrev~="xrev-content"] [role="group"]:has([data-testid="reply"]):has([data-testid="like"], [data-testid="unlike"]) {
+            display: flex !important;
+            flex-wrap: nowrap !important;
+            justify-content: space-between !important;
+            align-items: center !important;
+            gap: 2px !important;
+            min-width: 0 !important;
+            margin-left: calc(-1 * var(--xrev-action-gutter, 0px)) !important;
+            width: calc(100% + var(--xrev-action-gutter, 0px)) !important;
+            max-width: none !important;
+            box-sizing: border-box !important;
+            height: auto !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] [role="group"]:has([data-testid="reply"]):has([data-testid="like"], [data-testid="unlike"]) > * {
+            flex: 0 0 auto !important;
+            min-width: max-content !important;
+            max-width: 100% !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] [role="group"]:has([data-testid="reply"]):has([data-testid="like"], [data-testid="unlike"]) :is(button, a, [role="button"], div) {
+            flex-shrink: 0 !important;
+            column-gap: 2px !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] [role="group"]:has([data-testid="reply"]):has([data-testid="like"], [data-testid="unlike"]) div:has(> span) {
+            padding-inline: 2px !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] [role="group"]:has([data-testid="reply"]):has([data-testid="like"], [data-testid="unlike"]) span {
+            white-space: nowrap !important;
+        }
+
+        /* Share is the unlabelled-by-testid menu action at the end of X's
+         * tweet action row. Keep bookmark and the other named actions. */
+        html.xrev-grid [data-xrev~="xrev-content"] [role="group"]:has([data-testid="reply"]) :is([data-testid="share"], [aria-label="Share post"], [aria-label="Share"]),
+        html.xrev-grid [data-xrev~="xrev-content"] [role="group"]:has([data-testid="reply"]) > :last-child :is(button, [role="button"]):not([data-testid])[aria-haspopup="menu"],
+        html.xrev-grid [data-xrev~="xrev-content"] [role="group"]:has([data-testid="reply"]) > :last-child:is(button, [role="button"]):not([data-testid])[aria-haspopup="menu"] {
+            display: none !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] :is([data-testid="Tweet-User-Avatar"], [data-testid^="UserAvatar-Container"]) {
+            flex-shrink: 0 !important;
+        }
+
+        @container xrev-card (max-width: 340px) {
+            html.xrev-grid [data-xrev~="xrev-content"] [role="group"]:has([data-testid="reply"]):has([data-testid="like"], [data-testid="unlike"]) svg {
+                width: 16px !important;
+                height: 16px !important;
+                flex-shrink: 0 !important;
+            }
+
+            html.xrev-grid [data-xrev~="xrev-content"] [role="group"]:has([data-testid="reply"]):has([data-testid="like"], [data-testid="unlike"]) span {
+                font-size: 11px !important;
+            }
+
+            html.xrev-grid [data-xrev~="xrev-content"] [data-testid="videoPlayer"] [role="button"],
+            html.xrev-grid [data-xrev~="xrev-content"] [data-testid="videoPlayer"] button {
+                min-width: 24px !important;
+                padding-left: 2px !important;
+                padding-right: 2px !important;
+            }
+        }
+
+        /* Captions in a card's video only where it is 170px or wider
+         * (data-xrev-cc-room, set by markTimerFormat): smaller, they
+         * covered the picture and its play button. X draws them as the
+         * browser's own text track (styled with ::cue), which only takes
+         * colour-type properties, so the text and its box go transparent.
+         * A post's own page and the side panel keep captions. */
+        html.xrev-grid [data-xrev~="xrev-content"] [data-testid="videoPlayer"]:not([data-xrev-cc-room]) video::cue {
+            color: transparent !important;
+            background: transparent !important;
+            text-shadow: none !important;
+            outline: none !important;
+            visibility: hidden !important;
+        }
+
+        /* A card's control bar is too narrow for X's full set: the
+         * right-hand buttons spilled over the play button. Which controls
+         * a card shows is set in the toolbar's ▶ menu (by default all but
+         * picture-in-picture); captions also need the room (see above). */
+        html.xrev-grid [data-xrev~="xrev-content"] [data-testid="videoPlayer"]:not([data-xrev-cc-room]) :is(
+            [data-testid="captions"],
+            :has(> [data-testid="captions"]:only-child)
+        ) {
+            display: none !important;
+        }
+
+        ${hiddenControlsCss('card', '[data-xrev~="xrev-content"] ')}
+
+        /* Compact card controls, so settings and the timer fit too: play
+         * 26px, the other buttons 24px with 16px icons, and the timer's
+         * side margins 2px. The timer's font follows (see playbackCss). */
+        html.xrev-grid [data-xrev~="xrev-content"] [data-testid="videoPlayer"] ${playbackControl} {
+            flex: 0 0 26px !important;
+            min-width: 26px !important;
+            width: 26px !important;
+            min-height: 26px !important;
+            height: 26px !important;
+            padding: 0 !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] [data-testid="videoPlayer"] :has(> ${playbackControl}) ~ * :is(button, [role="button"]) {
+            min-width: 24px !important;
+            width: 24px !important;
+            min-height: 24px !important;
+            height: 24px !important;
+            padding: 0 !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] [data-testid="videoPlayer"] :is(${playbackControl}, :has(> ${playbackControl}) ~ * :is(button, [role="button"])) svg {
+            width: 16px !important;
+            height: 16px !important;
+        }
+
+        html.xrev-grid [data-xrev~="xrev-content"] [data-testid="videoPlayer"] :has(> ${playbackControl}) ~ * > [dir="ltr"]:not(:has(button, [role="button"], input)) {
+            margin-left: 2px !important;
+            margin-right: 2px !important;
+        }
+
+        ${playbackCss}
+
+        /* Explicit rows; flatten wrappers without moving React-owned nodes. */
+        html.xrev-home [data-xrev~="xrev-home-header"] {
+            display: grid !important;
+            grid-template-columns: minmax(0, 1fr) 32px !important;
+            grid-template-rows: auto auto minmax(28px, auto) !important;
+            gap: 2px 4px !important;
+            width: 100% !important;
+            min-width: 0 !important;
+            align-items: center !important;
+        }
+        html.xrev-home [data-xrev~="xrev-home-pass"] { display: contents !important; }
+        html.xrev-home [data-xrev~="xrev-home-name"] { grid-area: 1 / 1 / 2 / 3 !important; }
+        html.xrev-home [data-xrev~="xrev-home-handle"] { grid-area: 2 / 1 / 3 / 3 !important; }
+        html.xrev-home :is([data-xrev~="xrev-home-name"], [data-xrev~="xrev-home-handle"]),
+        html.xrev-home :is([data-xrev~="xrev-home-name"], [data-xrev~="xrev-home-handle"]) :is(div, span, a) {
+            min-width: 0 !important;
+            max-width: 100% !important;
+            white-space: normal !important;
+            overflow-wrap: anywhere !important;
+            text-overflow: clip !important;
+            overflow: visible !important;
+        }
+        html.xrev-home [data-xrev~="xrev-home-date"] {
+            grid-area: 3 / 1 / 4 / 2 !important;
+            margin: 0 !important;
+            min-width: max-content !important;
+            justify-self: start !important;
+        }
+        html.xrev-home [data-xrev~="xrev-home-date"] * {
+            white-space: nowrap !important;
+            overflow-wrap: normal !important;
+        }
+        html.xrev-home [data-xrev~="xrev-home-separator"] { display: none !important; }
+        html.xrev-home [data-xrev~="xrev-home-more"] {
+            grid-area: 3 / 2 / 4 / 3 !important;
+            position: relative !important;
+            inset: auto !important;
+            display: flex !important;
+            visibility: visible !important;
+            opacity: 1 !important;
+            width: 28px !important;
+            height: 28px !important;
+            margin: 0 !important;
+            justify-self: end !important;
+            align-items: center !important;
+            justify-content: center !important;
+            overflow: visible !important;
+        }
+
+        #xrev-toolbar {
+            position: fixed;
+            /* 6px left of X's Grok and Messages buttons in the corner. */
+            right: 100px;
+            bottom: 16px;
+            z-index: 1000;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            padding: 6px;
+            border: 1px solid #536471;
+            border-radius: 24px;
+            background: #15202b;
+            color: #f7f9f9;
+            font: 13px system-ui, sans-serif;
+            box-shadow: 0 2px 12px #0005;
+        }
+
+        #xrev-toolbar button {
+            border: 0;
+            border-radius: 18px;
+            padding: 7px 11px;
+            background: #273746;
+            color: inherit;
+            cursor: pointer;
+            font: inherit;
+        }
+
+        #xrev-toolbar button:hover {
+            background: #38536b;
+        }
+
+        #xrev-toolbar button:focus-visible {
+            outline: 2px solid #1d9bf0;
+            outline-offset: 2px;
+        }
+
+        #xrev-toolbar button:disabled {
+            opacity: .4;
+            cursor: default;
+        }
+
+        #xrev-toolbar [aria-pressed="true"] {
+            background: #1d9bf0;
+            color: white;
+        }
+
+        #xrev-toolbar[hidden] {
+            display: none;
+        }
+
+        #xrev-toolbar .xrev-sep {
+            align-self: stretch;
+            width: 1px;
+            margin: 3px 2px;
+            background: #536471;
+        }
+
+        /* The ▶ menu: a checkbox per video control, panel and cards. */
+        #xrev-video-menu {
+            position: absolute;
+            right: 0;
+            bottom: calc(100% + 8px);
+            padding: 10px 14px;
+            border: 1px solid #536471;
+            border-radius: 14px;
+            background: #15202b;
+            box-shadow: 0 2px 12px #0005;
+        }
+
+        #xrev-video-menu[hidden] {
+            display: none;
+        }
+
+        #xrev-video-menu .xrev-video-grid {
+            display: grid;
+            grid-template-columns: auto auto auto;
+            gap: 7px 16px;
+            align-items: center;
+            white-space: nowrap;
+        }
+
+        #xrev-video-menu .xrev-video-head {
+            font-weight: 600;
+            text-align: center;
+        }
+
+        #xrev-video-menu input {
+            justify-self: center;
+            width: 16px;
+            height: 16px;
+            margin: 0;
+            accent-color: #1d9bf0;
+            cursor: pointer;
+        }
+
+        #xrev-toolbar.xrev-light #xrev-video-menu {
+            border-color: #cfd9de;
+            background: #ffffff;
+            box-shadow: 0 2px 12px #0002;
+        }
+
+        #xrev-panel {
+            display: none;
+            position: fixed;
+            top: 0;
+            right: 0;
+            bottom: 0;
+            /*
+             * Placed just before X's #layers (z-index 1), next to the page
+             * wrapper (z-index 0): above X's full-width, transparent page
+             * wrappers, which otherwise swallow every click and scroll here,
+             * and below X's menus, dialogs and media viewer.
+             */
+            z-index: 1;
+            width: calc(100% * var(--xrev-split, .5));
+            border-left: 1px solid rgba(128, 128, 128, .28);
+            box-sizing: border-box;
+        }
+
+        /* Minimised, the panel is hidden but keeps its post loaded. */
+        html.xrev-split:not(.xrev-panel-min) #xrev-panel {
+            display: block;
+        }
+
+        /* X's Messages button sits in #layers, above the panel, and covers
+         * its bottom-right corner. Hide it while the panel shows; the Grok
+         * button above it stays. */
+        html.xrev-split:not(.xrev-panel-min) #layers :is(
+            [data-testid="chat-drawer-root"],
+            [data-testid="DMDrawer"]
+        ) {
+            display: none !important;
+        }
+
+        #xrev-panel iframe {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            border: 0;
+            background: transparent;
+        }
+
+        #xrev-panel.xrev-dragging iframe {
+            pointer-events: none;
+        }
+
+        #xrev-panel .xrev-panel-empty {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            color: #71767b;
+            font: 15px system-ui, sans-serif;
+            text-align: center;
+            pointer-events: none;
+        }
+
+        #xrev-panel .xrev-panel-grip {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            left: -4px;
+            z-index: 2;
+            width: 8px;
+            cursor: col-resize;
+            touch-action: none;
+        }
+
+        #xrev-panel.xrev-open .xrev-panel-empty {
+            display: none;
+        }
+
+        /* Until X's page is written in, the frame shows /robots.txt. */
+        #xrev-panel.xrev-open.xrev-loading .xrev-panel-empty {
+            display: flex;
+        }
+
+        #xrev-panel.xrev-loading iframe {
+            visibility: hidden;
+        }
+
+        #xrev-panel .xrev-panel-busy,
+        #xrev-panel.xrev-loading .xrev-panel-idle {
+            display: none;
+        }
+
+        #xrev-panel.xrev-loading .xrev-panel-busy {
+            display: inline;
+        }
+
+        #xrev-toolbar.xrev-light {
+            border-color: #cfd9de;
+            background: #ffffff;
+            color: #0f1419;
+            box-shadow: 0 2px 12px #0002;
+        }
+
+        #xrev-toolbar.xrev-light button {
+            background: #eff3f4;
+        }
+
+        #xrev-toolbar.xrev-light button:hover {
+            background: #d7dbdc;
+        }
+
+        #xrev-toolbar.xrev-light [aria-pressed="true"] {
+            background: #1d9bf0;
+            color: white;
+        }
+
+        #xrev-toolbar.xrev-light .xrev-sep {
+            background: #cfd9de;
+        }
+
+        /* Minimised: only the ‹ that expands it again, the same size and
+         * in the same spot as the » that minimised it. Kept after the
+         * theme rules, which it overrides. */
+        #xrev-toolbar .xrev-expand {
+            display: none;
+        }
+
+        /* Padding and border stay, so ‹ lands exactly where » was; the
+         * now invisible frame lets clicks through to the page. */
+        #xrev-toolbar.xrev-min,
+        #xrev-toolbar.xrev-light.xrev-min {
+            border-color: transparent;
+            background: transparent;
+            box-shadow: none;
+            pointer-events: none;
+        }
+
+        #xrev-toolbar.xrev-min > * {
+            display: none;
+        }
+
+        #xrev-toolbar.xrev-min > .xrev-expand {
+            display: flex;
+            box-shadow: 0 2px 8px #0005;
+            pointer-events: auto;
+        }
+
+        /* » and ‹: one round size, larger glyphs, centred by flex rather
+         * than text alignment, which X's page styles can override. */
+        #xrev-toolbar .xrev-arrow {
+            align-items: center;
+            justify-content: center;
+            width: 32px;
+            height: 32px;
+            padding: 0;
+            border-radius: 50%;
+            font-size: 22px;
+            line-height: 1;
+        }
+
+        #xrev-toolbar:not(.xrev-min) .xrev-minimise {
+            display: inline-flex;
+        }
+
+        /* A single ‹ is narrow; it needs more size than ». */
+        #xrev-toolbar .xrev-expand {
+            font-size: 26px;
+        }
+
+        /* The glyph's box is taller than its ink, which sits low. */
+        #xrev-toolbar .xrev-arrow > span {
+            display: block;
+            margin-top: -2px;
+        }
+
+        #xrev-toolbar.xrev-min > .xrev-expand > span {
+            margin-top: -4px;
+        }
+    `;
+
+    document.documentElement.appendChild(gridStyle);
+
+    let gridFrame = 0;
+    let gridToolbar;
+    let gridToggle;
+    let gridLess;
+    let gridMore;
+    let gridLabel;
+    let gridMode;
+    let gridNarrow;
+    let gridWide;
+    let gridWidthLabel;
+    let gridPanel;
+    let panelFrame = null;
+
+    const gridCells = new Set();
+    const gridFeeds = new Set();
+    const gridWrappers = new Set();
+    const gridContents = new Map();
+    const galleryMarks = new Map();
+    const homeHeaderMarks = new Map();
+
+    // Bumped whenever X changes the children of anything inside a post, so
+    // per-post measurements are reused until the post itself re-renders.
+    const cellVersions = new WeakMap();
+    const threadLineCache = new WeakMap();
+    const galleryCache = new WeakMap();
+
+    function touchGridCell(cell) {
+        if (cell) cellVersions.set(cell, (cellVersions.get(cell) || 0) + 1);
+    }
+
+    // Top-level X routes that look like a handle but are not profiles.
+    const RESERVED_ROUTES = new Set(['home', 'explore', 'notifications', 'messages',
+        'search', 'settings', 'compose', 'i', 'login', 'logout', 'signup',
+        'tos', 'privacy', 'help', 'jobs']);
+
+    function sizeHomeHeaders(primary) {
+        const profileRoute = pagePath().match(
+            // Every profile tab (posts, replies, reposts, subs, media...).
+            /^\/([\w]{1,15})(?:\/(?!status(?:\/|$))[\w-]+)?\/?$/
+        );
+        const statusRoute = /^\/(?:[^/]+|i\/web)\/status\/\d+(?:\/|$)/.test(pagePath());
+        const home = statusRoute || /^\/home\/?$/.test(pagePath()) || Boolean(
+            profileRoute && !RESERVED_ROUTES.has(profileRoute[1].toLowerCase())
+        );
+        document.documentElement.classList.toggle('xrev-home', home);
+        const next = new Map();
+        const mark = (node, name) => { if (node) next.set(node, name); };
+        if (home && primary) {
+            for (const article of primary.querySelectorAll('article[data-testid="tweet"]')) {
+                if (article.closest('[role="dialog"]')) continue;
+                // The opened status retains its native expanded header.
+                const cell = article.closest('[data-testid="cellInnerDiv"]');
+                if (statusRoute && cell && isPrimaryGridCell(cell)) continue;
+                const identity = article.querySelector('[data-testid="User-Name"]');
+                const more = article.querySelector('[data-testid="caret"]');
+                const date = identity?.querySelector('a:has(time)');
+                const handle = [...(identity?.querySelectorAll('a') || [])]
+                    .find(link => link.textContent.trim().startsWith('@'));
+                if (!identity || !handle || !date || !more) continue;
+                let header = identity.parentElement;
+                while (header && header !== article && !header.contains(more)) header = header.parentElement;
+                if (!header || header === article) continue;
+                const name = identity.firstElementChild;
+                if (!name || name.contains(handle) || name.contains(date)) continue;
+                // Keep React's nodes and handlers in place. Mark only the
+                // outer post identity, never the identity inside a quote.
+                mark(header, 'xrev-home-header');
+                // Every path to the grid must be flattened; styling just
+                // the handle's immediate parent leaves native flex widths.
+                for (const leaf of [name, handle, date, more]) {
+                    for (let parent = leaf.parentElement;
+                        parent && parent !== header; parent = parent.parentElement) {
+                        mark(parent, 'xrev-home-pass');
+                    }
+                }
+                mark(name, 'xrev-home-name');
+                mark(handle, 'xrev-home-handle');
+                mark(date, 'xrev-home-date');
+                mark(more, 'xrev-home-more');
+                for (const node of identity.querySelectorAll('span, div')) {
+                    if (!name.contains(node) && /^[·•]$/.test(node.textContent.trim()))
+                        mark(node, 'xrev-home-separator');
+                }
+            }
+        }
+        for (const [node, name] of homeHeaderMarks) {
+            if (next.get(node) !== name) xrevMark(node, name, false);
+        }
+        homeHeaderMarks.clear();
+        for (const [node, name] of next) {
+            xrevMark(node, name, true);
+            homeHeaderMarks.set(node, name);
+        }
+    }
+
+    function sizePhotoGalleries() {
+        const next = new Map();
+
+        for (const [cell, contents] of gridContents) {
+            const version = cellVersions.get(cell) || 0;
+            for (const content of contents) {
+                let cached = galleryCache.get(content);
+                if (!cached || cached.version !== version) {
+                    cached = { version, marks: findGalleryMarks(content) };
+                    galleryCache.set(content, cached);
+                }
+                for (const [node, name] of cached.marks) next.set(node, name);
+            }
+        }
+
+        for (const [node, name] of galleryMarks) {
+            if (next.get(node) !== name) {
+                xrevMark(node, name, false);
+            }
+        }
+
+        galleryMarks.clear();
+
+        for (const [node, name] of next) {
+            xrevMark(node, name, true);
+            galleryMarks.set(node, name);
+        }
+    }
+
+    /*
+     * A post is a row of two columns: the avatar (40px + 8px gap) and the
+     * body (header, text, media, actions). In narrow cards that left a
+     * strip under the avatar empty all the way down. Marks the row, the
+     * avatar column and the body so CSS can stack both in one grid cell:
+     * the body runs the full card width and only its header keeps clear
+     * of the avatar. Nothing moves. Skipped where the avatar column holds
+     * more than the avatar (a thread line running down to the next post)
+     * and for a status page's own expanded post.
+     */
+    function findSpanMarks(content, next) {
+        for (const article of content.querySelectorAll('article[data-testid="tweet"]')) {
+            if (xrevHas(article, 'xrev-original-status') ||
+                article.closest('[role="dialog"]')) continue;
+            const name = article.querySelector('[data-testid="User-Name"]');
+            const avatar = article.querySelector('[data-testid="Tweet-User-Avatar"]');
+            if (!name || !avatar) continue;
+            let column = avatar;
+            while (column.parentElement && column.parentElement !== article &&
+                !column.parentElement.contains(name)) column = column.parentElement;
+            const row = column.parentElement;
+            if (!row || row === article || row.children.length !== 2) continue;
+            const body = [...row.children].find(child => child !== column);
+            if (!body?.firstElementChild?.contains(name)) continue;
+            if (column.children.length !== 1) continue;
+            next.set(row, 'xrev-span-row');
+            next.set(column, 'xrev-span-avatar');
+            next.set(body, 'xrev-span-body');
+        }
+    }
+
+    function findGalleryMarks(content) {
+        const next = new Map();
+        findSpanMarks(content, next);
+
+        for (const photo of content.querySelectorAll('[data-testid="tweetPhoto"]')) {
+            let gallery = null;
+
+            // Stop at tweet/quote text: never merge two different posts'
+            // media. This also supports quotes without role=link markup.
+            for (
+                let node = photo.parentElement;
+                node && node !== content;
+                node = node.parentElement
+            ) {
+                if (
+                    node.matches('article') ||
+                    node.querySelector(
+                        '[data-testid="tweetText"], [data-testid="User-Name"]'
+                    )
+                ) {
+                    break;
+                }
+
+                if (
+                    node.querySelectorAll('[data-testid="tweetPhoto"]').length > 1
+                ) {
+                    gallery = node;
+                }
+            }
+
+            if (!gallery || next.has(gallery)) continue;
+
+            next.set(gallery, 'xrev-gallery');
+
+            for (
+                const tile of gallery.querySelectorAll(
+                    '[data-testid="tweetPhoto"]'
+                )
+            ) {
+                next.set(tile, 'xrev-gallery-tile');
+
+                for (
+                    let node = tile.parentElement;
+                    node && node !== gallery;
+                    node = node.parentElement
+                ) {
+                    next.set(node, 'xrev-gallery-pass');
+                }
+            }
+        }
+
+        return [...next];
+    }
+
+    /*
+     * Keep packing history by route, not by the current feed DOM node.
+     * X frequently remounts the feed after opening a post and pressing Back;
+     * a WeakMap keyed only by that old node lost the masonry skyline and made
+     * cards rebuild/stagger into place. A small route cache survives remounts.
+     */
+    const gridPacking = new Map();
+    const GRID_PACK_CACHE_LIMIT = 16;
+
+    let gridPackingTouch = 0;
+    let gridSettleFrames = 0;
+
+    // Last packed positions per feed, for re-aligning when X moves cells.
+    const gridPlacements = new WeakMap();
+
+    const observedSizes = new WeakMap();
+    const gridResize = new ResizeObserver(entries => {
+        let changed = false;
+        for (const entry of entries) {
+            const { width, height } = entry.contentRect;
+            // Ancestor height changes and slot writes are consequences of our
+            // layout, not a reason to run the whole layout again.
+            const size = xrevHas(entry.target, 'xrev-content')
+                ? width + ':' + height : String(width);
+            if (observedSizes.get(entry.target) !== size) {
+                observedSizes.set(entry.target, size); changed = true;
+            }
+        }
+        if (changed) scheduleGrid();
+    });
+
+    function getGridPacking(signature) {
+        let state = gridPacking.get(signature);
+
+        if (!state) {
+            state = {
+                signature,
+                records: new Map(),
+                touch: 0
+            };
+
+            gridPacking.set(signature, state);
+        }
+
+        state.touch = ++gridPackingTouch;
+
+        if (gridPacking.size > GRID_PACK_CACHE_LIMIT) {
+            let oldestKey = null;
+            let oldestTouch = Infinity;
+
+            for (const [key, value] of gridPacking) {
+                if (
+                    key !== signature &&
+                    value.touch < oldestTouch
+                ) {
+                    oldestKey = key;
+                    oldestTouch = value.touch;
+                }
+            }
+
+            if (oldestKey !== null) {
+                gridPacking.delete(oldestKey);
+            }
+        }
+
+        return state;
+    }
+
+    function scheduleGrid() {
+        if (!gridFrame) {
+            gridFrame = requestAnimationFrame(() => {
+                gridFrame = 0;
+                updateGrid();
+
+                /*
+                 * Route restoration in X happens over several React/virtualizer
+                 * commits. Reconcile before each following paint until it settles.
+                 */
+                if (gridSettleFrames > 0) {
+                    gridSettleFrames--;
+                    scheduleGrid();
+                }
+            });
+        }
+    }
+
+    function settleGrid(frames = 6) {
+        gridSettleFrames = Math.max(gridSettleFrames, frames);
+        scheduleGrid();
+    }
+
+    function flushGrid() {
+        if (gridFrame) {
+            cancelAnimationFrame(gridFrame);
+            gridFrame = 0;
+        }
+        updateGrid();
+        if (gridSettleFrames > 0) scheduleGrid();
+    }
+
+    function setGridProperty(el, name, value) {
+        if (el.style.getPropertyValue(name) !== value) {
+            el.style.setProperty(name, value);
+        }
+    }
+
+    function forgetGridCell(cell) {
+        gridResize.unobserve(cell);
+
+        for (const content of gridContents.get(cell) || []) {
+            xrevMark(content, 'xrev-content', false);
+            content.style.removeProperty('--xrev-local-width');
+            gridResize.unobserve(content);
+        }
+
+        gridContents.delete(cell);
+        xrevMark(cell, 'xrev-cell', false);
+        xrevMark(cell, 'xrev-primary-post', false);
+
+        for (const name of [
+            '--xrev-slot',
+            '--xrev-x',
+            '--xrev-y'
+        ]) {
+            cell.style.removeProperty(name);
+        }
+
+        gridCells.delete(cell);
+    }
+
+    // After a change in the ▶ menu: cards here, and the split panel's
+    // document (the popup follows through the storage event).
+    function applyVideoControls() {
+        applyVideoControlClasses(document.documentElement, 'card');
+        try {
+            const doc = panelFrame?.contentDocument;
+            if (doc?.documentElement) applyVideoControlClasses(doc.documentElement, 'panel');
+        } catch (e) {}
+    }
+
+    function updateGrid() {
+        if (!document.body) return;
+
+        if (!gridToolbar) {
+            gridToolbar = document.createElement('div');
+            gridToolbar.id = 'xrev-toolbar';
+            gridToolbar.setAttribute('role', 'group');
+            gridToolbar.setAttribute('aria-label', 'xrev post layout');
+
+            const button = (text, title, action) => {
+                const b = document.createElement('button');
+                b.type = 'button';
+                b.textContent = text;
+                b.title = title;
+                b.setAttribute('aria-label', title);
+                b.addEventListener('click', action);
+                gridToolbar.appendChild(b);
+                return b;
+            };
+
+            // Wraps an arrow glyph so it can be nudged to the optical centre.
+            const arrow = (b, name) => {
+                const glyph = document.createElement('span');
+                glyph.textContent = b.textContent;
+                b.replaceChildren(glyph);
+                b.classList.add('xrev-arrow', name);
+                return b;
+            };
+
+            // The only button left while the toolbar is minimised.
+            arrow(button(
+                '‹',
+                'Show the xrev toolbar',
+                () => setToolbarMinimised(false)
+            ), 'xrev-expand');
+
+            gridToggle = button(
+                'xrev',
+                'Toggle side-by-side posts (Alt+G)',
+                () => {
+                    gridEnabled = !gridEnabled;
+                    gridStore.set(
+                        'enabled',
+                        gridEnabled ? '1' : '0'
+                    );
+                    scheduleGrid();
+                }
+            );
+
+            gridLess = button(
+                '−',
+                'Fewer columns',
+                () => changeGridColumns(-1)
+            );
+
+            // The count doubles as the way back to automatic fitting.
+            gridLabel = button(
+                '',
+                'Fit columns automatically',
+                () => {
+                    manualColumns = false;
+                    gridEnabled = true;
+                    gridStore.set(columnKey('manual-columns'), '0');
+                    gridStore.set('enabled', '1');
+                    scheduleGrid();
+                }
+            );
+
+            gridMore = button(
+                '+',
+                'More columns',
+                () => changeGridColumns(1)
+            );
+
+            const separator = document.createElement('span');
+            separator.className = 'xrev-sep';
+            gridToolbar.appendChild(separator);
+
+            gridMode = button(
+                '',
+                '',
+                () => setOpenMode(openMode === 'split' ? 'popup' : 'split')
+            );
+
+            gridNarrow = button(
+                '−',
+                'Narrower post panel',
+                () => setPanelWidth(openMode, Math.round(panelWidths[openMode] / 5) * 5 - 5)
+            );
+
+            // The percentage doubles as a reset to the default width.
+            gridWidthLabel = button(
+                '',
+                '',
+                () => setPanelWidth(openMode, PANEL_WIDTH_DEFAULT[openMode])
+            );
+
+            gridWide = button(
+                '+',
+                'Wider post panel',
+                () => setPanelWidth(openMode, Math.round(panelWidths[openMode] / 5) * 5 + 5)
+            );
+
+            const videoSeparator = document.createElement('span');
+            videoSeparator.className = 'xrev-sep';
+            gridToolbar.appendChild(videoSeparator);
+
+            // ▶: which video controls show, in the panel and in cards.
+            const videoMenu = document.createElement('div');
+            videoMenu.id = 'xrev-video-menu';
+            videoMenu.hidden = true;
+            videoMenu.setAttribute('role', 'group');
+            videoMenu.setAttribute('aria-label', 'Video controls');
+            const videoGrid = document.createElement('div');
+            videoGrid.className = 'xrev-video-grid';
+            const videoCell = (text, className) => {
+                const cell = document.createElement('span');
+                cell.textContent = text;
+                if (className) cell.className = className;
+                videoGrid.appendChild(cell);
+            };
+            videoCell('');
+            for (const [, scopeLabel] of VIDEO_SCOPES) videoCell(scopeLabel, 'xrev-video-head');
+            for (const [key, label] of VIDEO_CONTROLS) {
+                videoCell(label);
+                for (const [scope, scopeLabel] of VIDEO_SCOPES) {
+                    const box = document.createElement('input');
+                    box.type = 'checkbox';
+                    box.checked = videoControlOn(scope, key);
+                    box.title = `${label} in ${scopeLabel.toLowerCase()}`;
+                    box.setAttribute('aria-label', box.title);
+                    box.addEventListener('change', () => {
+                        gridStore.set(`video-${scope}-${key}`, box.checked ? '1' : '0');
+                        applyVideoControls();
+                    });
+                    videoGrid.appendChild(box);
+                }
+            }
+            videoMenu.appendChild(videoGrid);
+
+            const videoButton = button(
+                '▶',
+                'Video controls',
+                () => {
+                    videoMenu.hidden = !videoMenu.hidden;
+                    videoButton.setAttribute('aria-expanded', String(!videoMenu.hidden));
+                }
+            );
+            videoButton.setAttribute('aria-expanded', 'false');
+            gridToolbar.appendChild(videoMenu);
+            // A click anywhere else closes the menu.
+            document.addEventListener('pointerdown', e => {
+                if (videoMenu.hidden || videoMenu.contains(e.target) ||
+                    videoButton.contains(e.target)) return;
+                videoMenu.hidden = true;
+                videoButton.setAttribute('aria-expanded', 'false');
+            }, true);
+
+            arrow(button(
+                '»',
+                'Minimise the toolbar',
+                () => setToolbarMinimised(true)
+            ), 'xrev-minimise');
+
+            gridToolbar.classList.toggle('xrev-min', toolbarMinimised);
+            document.body.appendChild(gridToolbar);
+        }
+
+        // An older copy that started after this one adds a second toolbar.
+        if (document.querySelectorAll('#xrev-toolbar').length > 1) showDuplicateWarning();
+
+        if (!gridPanel) createPanel();
+        else placePanel();
+
+        // Dialogs and the dedicated comments window retain their native layout.
+        const primary = document.querySelector(
+            '[data-testid="primaryColumn"]'
+        );
+
+        sizeHomeHeaders(primary);
+
+        const candidates = new Set();
+
+        // Excluding the original from packing alone is insufficient: X lets
+        // its article and video expand to the widened timeline's full width.
+        // Mark the article itself, leaving the reply feed and native slot alone.
+        for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+            const cell = article.closest('[data-testid="cellInnerDiv"]');
+            xrevMark(article, 'xrev-original-status', Boolean(
+                gridEnabled && primary?.contains(article) &&
+                !article.closest('[role="dialog"]') && cell &&
+                cell.querySelector('article[data-testid="tweet"]') === article &&
+                isPrimaryGridCell(cell)
+            ));
+        }
+
+        if (gridEnabled && primary) {
+            for (
+                const article of primary.querySelectorAll(
+                    'article[data-testid="tweet"]'
+                )
+            ) {
+                if (article.closest('[role="dialog"]')) continue;
+
+                if (
+                    article.parentElement?.closest(
+                        'article[data-testid="tweet"]'
+                    )
+                ) {
+                    continue;
+                }
+
+                const cell = article.closest(
+                    '[data-testid="cellInnerDiv"]'
+                );
+
+                if (
+                    cell?.parentElement &&
+                    primary.contains(cell.parentElement)
+                ) {
+                    candidates.add(cell.parentElement);
+                }
+            }
+        }
+
+        for (const feed of gridFeeds) {
+            if (!candidates.has(feed)) {
+                xrevMark(feed, 'xrev-feed', false);
+                gridFeeds.delete(feed);
+            }
+        }
+
+        const wrappers = new Set();
+
+        for (const feed of candidates) {
+            for (
+                let wrapper = feed;
+                wrapper && wrapper !== primary;
+                wrapper = wrapper.parentElement
+            ) {
+                wrappers.add(wrapper);
+                xrevMark(wrapper, 'xrev-stretch', true);
+
+                if (!gridWrappers.has(wrapper)) {
+                    gridWrappers.add(wrapper);
+                    gridResize.observe(wrapper);
+                }
+            }
+        }
+
+        for (const wrapper of gridWrappers) {
+            if (!wrappers.has(wrapper)) {
+                xrevMark(wrapper, 'xrev-stretch', false);
+                gridResize.unobserve(wrapper);
+                gridWrappers.delete(wrapper);
+            }
+        }
+
+        const activeCells = new Set();
+
+        for (const feed of candidates) {
+            gridFeeds.add(feed);
+            xrevMark(feed, 'xrev-feed', true);
+
+            for (const cell of feed.children) {
+                /*
+                 * A post can have several sibling wrappers (context, media,
+                 * accessibility nodes). All must receive the card width.
+                 * Loaders, empty virtual spacers and other rows stay entirely native.
+                 */
+                if (
+                    !cell.matches('[data-testid="cellInnerDiv"]') ||
+                    !cell.children.length ||
+                    !cell.querySelector('article[data-testid="tweet"]') ||
+                    isPrimaryGridCell(cell)
+                ) {
+                    continue;
+                }
+
+                const contents = [...cell.children];
+                const old = gridContents.get(cell);
+
+                if (
+                    old &&
+                    (
+                        old.length !== contents.length ||
+                        old.some(
+                            (node, i) => node !== contents[i]
+                        )
+                    )
+                ) {
+                    forgetGridCell(cell);
+                }
+
+                activeCells.add(cell);
+                xrevMark(cell, 'xrev-cell', true);
+
+                for (const content of contents) {
+                    xrevMark(content, 'xrev-content', true);
+                }
+
+                gridContents.set(cell, contents);
+
+                if (!gridCells.has(cell)) {
+                    gridCells.add(cell);
+                    gridResize.observe(cell);
+
+                    for (const content of contents) {
+                        gridResize.observe(content);
+                    }
+                }
+            }
+        }
+
+        for (const cell of gridCells) {
+            if (!activeCells.has(cell)) {
+                forgetGridCell(cell);
+            }
+        }
+
+        const active =
+            gridEnabled &&
+            candidates.size > 0;
+
+        /*
+         * An empty/loading timeline must not collapse the profile back to 600px.
+         */
+        document.documentElement.classList.toggle(
+            'xrev-grid',
+            gridEnabled
+        );
+
+        /*
+         * Use the rendered feed, not the viewport, to avoid squeezing three
+         * columns into an unexpectedly constrained wrapper. Keep cards >=390px
+         * where space permits; a narrow screen naturally becomes one column.
+         */
+        let actualColumns = 1;
+
+        for (const feed of candidates) {
+            const available = Math.max(
+                1,
+                feed.clientWidth - 16
+            );
+
+            const columns = manualColumns
+                ? gridColumns
+                : Math.min(
+                    gridColumns,
+                    Math.max(
+                        1,
+                        Math.floor(
+                            (available + 10) / 400
+                        )
+                    )
+                );
+
+            setGridProperty(
+                feed,
+                '--xrev-cols',
+                String(columns)
+            );
+
+            setGridProperty(
+                feed,
+                '--xrev-card-width',
+                (
+                    (
+                        available -
+                        10 * (columns - 1)
+                    ) /
+                    columns
+                ) + 'px'
+            );
+
+            actualColumns = Math.max(
+                actualColumns,
+                columns
+            );
+        }
+
+        gridToggle.setAttribute(
+            'aria-pressed',
+            String(gridEnabled)
+        );
+
+        // Settings, messages and similar pages have nothing to lay out. A
+        // timeline that is loading, or a page with tabs (a profile whose
+        // tab is empty), keeps it: it vanished on every tab switch.
+        const hasPosts = candidates.size > 0 || Boolean(
+            primary?.querySelector(
+                '[data-testid="cellInnerDiv"] article[data-testid="tweet"], ' +
+                '[role="progressbar"], [role="tablist"]'
+            )
+        );
+        if (gridToolbar.hidden === hasPosts) gridToolbar.hidden = !hasPosts;
+
+        // Match X's light theme; Dim and Lights out keep the dark toolbar.
+        const background = getComputedStyle(document.body).backgroundColor
+            .match(/\d+(?:\.\d+)?/g)?.map(Number) || [];
+        const light = background.length >= 3 && (background[3] ?? 1) > 0 &&
+            0.299 * background[0] + 0.587 * background[1] + 0.114 * background[2] > 160;
+        gridToolbar.classList.toggle('xrev-light', light);
+        gridPanel.classList.toggle('xrev-light', light);
+        updatePanelControls();
+
+        displayedColumns = candidates.size
+            ? actualColumns
+            : gridColumns;
+
+        gridLess.disabled =
+            displayedColumns <= 1;
+
+        gridMore.disabled =
+            displayedColumns >= 8;
+
+        const label = gridEnabled
+            ? actualColumns + ' cols'
+            : 'off';
+
+        if (gridLabel.textContent !== label) {
+            gridLabel.textContent = label;
+        }
+
+        const labelTitle = manualColumns
+            ? 'Manual column count; click to fit automatically again'
+            : 'Automatically fitted; − / + switches to your exact column count';
+        if (gridLabel.title !== labelTitle) {
+            gridLabel.title = labelTitle;
+            gridLabel.setAttribute('aria-label', labelTitle);
+        }
+        gridLabel.setAttribute('aria-pressed', String(gridEnabled && !manualColumns));
+
+        sizePhotoGalleries();
+
+        if (active) {
+            // Candidates are found in document order, so this index stays
+            // with its timeline even when another one remounts.
+            let feedIndex = 0;
+            for (const feed of candidates) {
+                packFeed(feed, feedIndex++);
+            }
+        }
+
+        fixLayout();
+    }
+
+    // A row owns stable slots even while X unmounts some of its members.
+    // Never use the currently mounted index as a post's column.
+    function postKey(cell) {
+        const article = cell.querySelector('article[data-testid="tweet"]');
+        const link = article?.querySelector('a[href*="/status/"] time')?.closest('a');
+        const id = link?.getAttribute('href')?.match(/\/status\/(\d+)/)?.[1];
+        if (id || !article) return id || '';
+        // Promoted posts carry no timestamp link. Key them by content: keying
+        // by the cell element lost their record on every remount, and kept
+        // every detached cell alive in the packing cache.
+        const author = article.querySelector('[data-testid="User-Name"] a[href^="/"]');
+        const text = article.querySelector('[data-testid="tweetText"]');
+        const media = article.querySelector('[data-testid="tweetPhoto"] img, video[poster]');
+        return 'post:' + (author?.getAttribute('href') || '') + '|' +
+            (text?.textContent.slice(0, 120) || '') + '|' +
+            (media?.getAttribute(media.tagName === 'VIDEO' ? 'poster' : 'src') || '');
+    }
+
+    function isEmptyGridRow(cell) {
+        // X inserts empty zero-height cellInnerDivs between post batches.
+        // They are not section boundaries. Keep genuine spacers, composers,
+        // loaders, headings and interactive rows in the native flow.
+        return !cell.textContent.trim() &&
+            !cell.querySelector('article, img, video, svg, input, textarea, button, a, [role="button"], [role="progressbar"], [role="textbox"]') &&
+            cell.getBoundingClientRect().height <= 1;
+    }
+
+    function isPrimaryGridCell(cell) {
+        const statusID = pagePath().match(/\/status\/(\d+)/)?.[1];
+        return Boolean(statusID && postKey(cell) === statusID);
+    }
+
+    function hasOutgoingThreadLine(cell) {
+        // X renders profile and status reply threads as separate cells joined
+        // by a vertical rule under the avatar. Do not infer relationships
+        // from adjacent authors or quoted-post links.
+        const isReplyTimeline = /^\/[^/]+\/with_replies\/?$/.test(pagePath()) ||
+            /^\/(?:[^/]+|i\/web)\/status\/\d+(?:\/|$)/.test(pagePath());
+        if (!isReplyTimeline) return false;
+        const article = cell.querySelector('article[data-testid="tweet"]');
+        const avatar = article?.querySelector(
+            '[data-testid="Tweet-User-Avatar"], [data-testid^="UserAvatar-Container"]'
+        );
+        if (!avatar) return false;
+        // Scanning every div is costly, so reuse the answer until the post
+        // re-renders or changes size.
+        const version = cellVersions.get(cell) || 0;
+        const size = article.offsetWidth + 'x' + article.offsetHeight;
+        const cached = threadLineCache.get(cell);
+        if (cached && cached.article === article && cached.version === version &&
+            cached.size === size) return cached.result;
+        const result = findThreadLine(article, avatar);
+        threadLineCache.set(cell, { article, version, size, result });
+        return result;
+    }
+
+    function findThreadLine(article, avatar) {
+        const a = avatar.getBoundingClientRect();
+        const center = (a.left + a.right) / 2;
+        return [...article.querySelectorAll('div')].some(node => {
+            const r = node.getBoundingClientRect();
+            if (r.width < 1 || r.width > 3 || r.height < 8 ||
+                Math.abs((r.left + r.right) / 2 - center) > 4 ||
+                r.bottom <= a.bottom + 8 || r.top < a.bottom - 4) return false;
+            const style = getComputedStyle(node);
+            return style.backgroundColor !== 'rgba(0, 0, 0, 0)' &&
+                style.backgroundColor !== 'transparent' && style.visibility !== 'hidden';
+        });
+    }
+
+    function packFeed(feed, feedIndex) {
+        const columns = Number(feed.style.getPropertyValue('--xrev-cols')) || 1;
+        const available = Math.max(1, feed.clientWidth - 16);
+        // Separate independently virtualized timelines on the same page.
+        const signature = pagePath() + pageSearch + ':' + feedIndex +
+            ':' + columns + ':' + Math.round(available);
+        const state = getGridPacking(signature);
+        const batches = [];
+        // Batches that follow a native row open a new segment.
+        const opened = new Set();
+        let group = [];
+        let afterRow = false;
+        const flush = () => {
+            if (group.length) batches.push(group);
+            group = [];
+        };
+        for (const cell of feed.children) {
+            if (!gridContents.has(cell)) {
+                if (!isEmptyGridRow(cell)) {
+                    flush();
+                    afterRow = true;
+                }
+                continue;
+            }
+            if (!group.length && afterRow) opened.add(group);
+            group.push(cell);
+        }
+        flush();
+
+        const natives = new Map();
+        for (const batch of batches) {
+            nativeTops(feed, batch).forEach((top, i) => natives.set(batch[i], top));
+        }
+
+        // The same post can be mounted twice (a repost and its original).
+        // Give repeats distinct keys; a shared record makes their heights
+        // fight and re-schedules the layout every frame. Match each copy to
+        // the stored copy nearest its native slot: numbering copies in mount
+        // order handed one copy's record to the other once the first unmounted.
+        const copies = new Map();
+        for (const batch of batches) for (const cell of batch) {
+            const context = cell.querySelector(
+                'article[data-testid="tweet"] [data-testid="socialContext"]'
+            )?.textContent.trim();
+            const key = postKey(cell) + (context ? '|' + context : '');
+            if (!copies.has(key)) copies.set(key, []);
+            copies.get(key).push(cell);
+        }
+        const cellKeys = new Map();
+        for (const [key, cells] of copies) {
+            const stored = [];
+            while (state.records.has(stored.length ? key + '#' + stored.length : key))
+                stored.push(stored.length ? key + '#' + stored.length : key);
+            let next = stored.length;
+            for (const cell of cells) {
+                const distance = k => Math.abs(state.records.get(k).native - natives.get(cell));
+                const best = stored.filter(Boolean).sort((a, b) => distance(a) - distance(b))[0];
+                if (best) {
+                    stored[stored.indexOf(best)] = null;
+                    cellKeys.set(cell, best);
+                } else {
+                    cellKeys.set(cell, next ? key + '#' + next : key);
+                    next++;
+                }
+            }
+        }
+
+        // Write widths once before measuring. Ordinary cards never change
+        // width merely because a partial batch mounts or disappears.
+        for (const batch of batches) for (const cell of batch) {
+            const width = (available - 10 * (columns - 1)) / columns;
+            for (const content of gridContents.get(cell))
+                setGridProperty(content, '--xrev-local-width', Math.max(1, width) + 'px');
+        }
+        const heights = new Map();
+        // Reclaim the avatar gutter for actions without moving the avatar,
+        // post text or media. Measure the parent, which our row CSS does not
+        // move, so repeated layouts cannot progressively widen the row.
+        for (const batch of batches) for (const cell of batch) {
+            for (const content of gridContents.get(cell)) {
+                for (const row of content.querySelectorAll(
+                    '[role="group"]:has([data-testid="reply"]):has([data-testid="like"], [data-testid="unlike"])'
+                )) {
+                    const article = row.closest('article');
+                    if (!article || !row.parentElement) continue;
+                    const gutter = Math.max(0, Math.min(80,
+                        row.parentElement.getBoundingClientRect().left -
+                        article.getBoundingClientRect().left - 16));
+                    setGridProperty(row, '--xrev-action-gutter', gutter + 'px');
+                }
+            }
+        }
+        // Replies joined by a thread line stay in their parent's column.
+        const threaded = new Set();
+        for (const batch of batches) {
+            for (let i = 1; i < batch.length; i++) {
+                if (hasOutgoingThreadLine(batch[i - 1])) threaded.add(batch[i]);
+            }
+        }
+        const shown = new Map();
+        for (const batch of batches) for (const cell of batch) {
+            const rects = gridContents.get(cell).map(content => content.getBoundingClientRect());
+            heights.set(cell, Math.max(1, Math.ceil(rects.reduce((sum, rect) => sum + rect.height, 0))));
+            shown.set(cell, Math.max(...rects.map(rect => rect.bottom)));
+        }
+        const placements = [];
+        for (const batch of batches) {
+            const n = batch.length;
+            const keys = batch.map(cell => cellKeys.get(cell));
+            const records = keys.map(key => state.records.get(key));
+            const count = columns;
+            const used = [];
+            const shrinks = [];
+            for (let i = 0; i < n; i++) {
+                const previous = records[i];
+                let height = heights.get(batch[i]);
+                let shrink = 0;
+                // Confirm shrinkage, then reclaim obsolete space. Never retain
+                // the historical tallest-row measurement indefinitely.
+                if (previous && height < previous.height - 2) {
+                    shrink = height;
+                    if (previous.shrink !== height) {
+                        height = previous.height;
+                        scheduleGrid();
+                    }
+                }
+                used.push(height);
+                shrinks.push(shrink);
+            }
+
+            /*
+             * Lay the batch out from an anchor post that is on screen: posts
+             * after it stack down from its stored skyline, posts before it
+             * stack up. Anchoring on the first mounted post moved every
+             * visible card whenever a post mounting above the viewport was
+             * new (an ad, a fresh column count) or had changed height.
+             */
+            let a = -1;
+            for (let i = 0; i < n; i++) {
+                if (!records[i]) continue;
+                if (a < 0) a = i;
+                // A freshly mounted card still sits at its native slot.
+                if (batch[i].style.getPropertyValue('--xrev-y') && shown.get(batch[i]) > 0) {
+                    a = i;
+                    break;
+                }
+            }
+            // Columns start level wherever the segment's top is in view.
+            const level = a < 0 || (opened.has(batch) || natives.get(batch[0]) <= 1) &&
+                batch[0].getBoundingClientRect().top >= 0;
+            if (level) a = 0;
+            const anchor = records[a];
+            const start = anchor ? anchor.start : 0;
+            const skyline = level ? Array(count).fill(start) : [...anchor.before];
+            const segment = (anchor || records.find(Boolean))?.segment || { tail: keys[n - 1] };
+            // Only the true loaded tail reserves the remaining skyline height.
+            // An arbitrary virtualized window edge must not introduce a gap.
+            if (keys.includes(segment.tail) || !records[n - 1])
+                segment.tail = keys[n - 1];
+            const fit = (i, joined, line, pick) => {
+                if (joined >= 0 && joined < count) return joined;
+                if (records[i] && records[i].col < count) return records[i].col;
+                return line.indexOf(pick(...line));
+            };
+            const cols = [];
+            const ys = [];
+            const bottoms = [...skyline];
+            for (let i = a; i < n; i++) {
+                cols[i] = fit(i, threaded.has(batch[i]) ? cols[i - 1] ?? records[i - 1]?.col : -1,
+                    bottoms, Math.min);
+                ys[i] = bottoms[cols[i]];
+                bottoms[cols[i]] += used[i] + 10;
+            }
+            const tops = [...skyline];
+            for (let i = a - 1; i >= 0; i--) {
+                cols[i] = fit(i, threaded.has(batch[i + 1]) ? cols[i + 1] : -1, tops, Math.max);
+                ys[i] = tops[cols[i]] - used[i] - 10;
+                tops[cols[i]] = ys[i];
+            }
+            const slots = used.map(height => Math.max(1, Math.ceil((height + 10) / count)));
+            const starts = [];
+            starts[a] = start;
+            for (let i = a + 1; i < n; i++) starts[i] = starts[i - 1] + slots[i - 1];
+            for (let i = a - 1; i >= 0; i--) starts[i] = starts[i + 1] - slots[i];
+            if (keys[n - 1] === segment.tail) {
+                slots[n - 1] += Math.max(0,
+                    Math.ceil(Math.max(...bottoms) - starts[n - 1] - slots[n - 1]));
+            }
+            // Store every post's skyline as if packed down from the segment
+            // top, so any of them can anchor a later pass.
+            const next = [...bottoms];
+            for (let i = n - 1; i >= 0; i--) {
+                next[cols[i]] = ys[i];
+                state.records.set(keys[i], {
+                    before: [...next], start: starts[i], col: cols[i], height: used[i],
+                    shrink: shrinks[i], segment, native: natives.get(batch[i])
+                });
+            }
+            const width = (available - 10 * (count - 1)) / count;
+            placements.push({
+                cells: batch, ys, slots, anchor: a, start,
+                xs: cols.map(col => 8 + col * (width + 10))
+            });
+        }
+        for (const { cells, slots, xs } of placements) cells.forEach((cell, i) => {
+            setGridProperty(cell, '--xrev-slot', slots[i] + 'px');
+            setGridProperty(cell, '--xrev-x', xs[i] + 'px');
+        });
+        gridPlacements.set(feed, placements);
+        alignFeed(feed);
+    }
+
+    // Feed-relative native offsets. X positions cells with an inline
+    // translateY, which reads without forcing layout; otherwise measure.
+    function nativeTops(feed, cells) {
+        const tops = cells.map(cell => parseFloat(
+            /translateY\((-?[\d.]+)px\)/.exec(cell.style.transform)?.[1]));
+        if (tops.every(Number.isFinite)) return tops;
+        const origin = feed.getBoundingClientRect().top;
+        return cells.map(cell => cell.getBoundingClientRect().top - origin);
+    }
+
+    // Masonry positions are relative to the anchor's native slot, so this
+    // can rerun cheaply the moment X moves its cells.
+    function alignFeed(feed) {
+        for (const { cells, ys, anchor, start } of gridPlacements.get(feed) || []) {
+            if (cells[anchor].parentElement !== feed) continue;
+            const tops = nativeTops(feed, cells);
+            const origin = tops[anchor] - start;
+            cells.forEach((cell, i) => {
+                if (cell.parentElement === feed)
+                    setGridProperty(cell, '--xrev-y', origin + ys[i] - tops[i] + 'px');
+            });
+        }
+    }
+
+    function changeGridColumns(delta) {
+        /*
+         * Step from the visible count, not a hidden request above the auto cap.
+         */
+        gridColumns = Math.max(
+            1,
+            Math.min(
+                8,
+                displayedColumns + delta
+            )
+        );
+
+        displayedColumns =
+            gridColumns;
+
+        manualColumns = true;
+        gridEnabled = true;
+
+        gridStore.set(
+            columnKey('columns'),
+            gridColumns
+        );
+
+        gridStore.set(
+            columnKey('manual-columns'),
+            '1'
+        );
+
+        gridStore.set(
+            'enabled',
+            '1'
+        );
+
+        scheduleGrid();
+    }
+
+    document.addEventListener(
+        'keydown',
+        e => {
+            if (
+                e.target instanceof Element && e.target.closest(
+                    'input, textarea, [contenteditable="true"], [role="textbox"]'
+                )
+            ) {
+                return;
+            }
+
+            if (
+                e.altKey &&
+                !e.ctrlKey &&
+                !e.metaKey &&
+                // The physical key: on macOS, Alt+G types "©".
+                e.code === 'KeyG'
+            ) {
+                e.preventDefault();
+
+                gridEnabled =
+                    !gridEnabled;
+
+                gridStore.set(
+                    'enabled',
+                    gridEnabled
+                        ? '1'
+                        : '0'
+                );
+
+                scheduleGrid();
+            }
+        }
+    );
+
+    const nativeStyles =
+        new WeakMap();
+
+    const gridMutations =
+        new MutationObserver(
+            records => {
+                let mounted = false;
+                let moved = false;
+
+                if (
+                    records.filter(
+                        record => {
+                            if (
+                                gridToolbar?.contains(
+                                    record.target
+                                ) ||
+                                gridPanel?.contains(
+                                    record.target
+                                )
+                            ) {
+                                return false;
+                            }
+
+                            if (
+                                record.type !==
+                                'attributes'
+                            ) {
+                                const target = record.target instanceof Element
+                                    ? record.target : null;
+                                // Any child change inside a post invalidates
+                                // what was measured from its subtree.
+                                touchGridCell(target?.closest('[data-testid="cellInnerDiv"]'));
+
+                                // Video controls re-render as they play, and
+                                // popups mount in #layers. Neither moves a card;
+                                // a size change still reaches the ResizeObserver.
+                                if (target?.closest('[data-testid="videoPlayer"], #layers')) {
+                                    return false;
+                                }
+
+                                // X mounting, unmounting or replacing cells.
+                                if (
+                                    record.type === 'childList' &&
+                                    (gridFeeds.has(record.target) || gridCells.has(record.target))
+                                ) {
+                                    mounted = true;
+                                }
+
+                                return true;
+                            }
+
+                            /*
+                             * Ignore our own custom-property writes, but catch X
+                             * changing its translateY offsets, virtual height or
+                             * mounted item identity.
+                             */
+                            if (!gridCells.has(record.target) &&
+                                !gridWrappers.has(record.target) &&
+                                record.target.getAttribute('data-testid') !== 'cellInnerDiv') return false;
+                            const native =
+                                (
+                                    record.target
+                                        .getAttribute(
+                                            'style'
+                                        ) ||
+                                    ''
+                                )
+                                    .replace(
+                                        /--xrev-[\w-]+\s*:[^;]*(;|$)/g,
+                                        ''
+                                    )
+                                    .trim();
+
+                            if (
+                                nativeStyles.get(
+                                    record.target
+                                ) === native
+                            ) {
+                                return false;
+                            }
+
+                            nativeStyles.set(
+                                record.target,
+                                native
+                            );
+
+                            if (gridCells.has(record.target)) {
+                                moved = true;
+                            }
+
+                            return true;
+                        }
+                    )
+                .length) {
+                    /*
+                     * X commits cell mounts and offsets outside our frame
+                     * callback, so waiting for the next frame could paint
+                     * unstyled cells or cards at stale offsets for a frame.
+                     * This microtask always runs before that paint.
+                     */
+                    if (mounted) {
+                        flushGrid();
+                    } else {
+                        if (moved) {
+                            for (const feed of gridFeeds) alignFeed(feed);
+                        }
+
+                        scheduleGrid();
+                    }
+                }
+            }
+        );
+
+    gridMutations.observe(
+        document.documentElement,
+        {
+            // No characterData: ticking timers and counters would rerun the
+            // whole layout. Text that changes a card's size reaches the
+            // ResizeObserver instead.
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: [
+                'style',
+                'data-testid'
+            ]
+        }
+    );
+
+    window.addEventListener(
+        'resize',
+        scheduleGrid
+    );
+
+    /*
+     * Back/forward restores X's route, scroll window and virtualized offsets in
+     * several commits. Reuse the cached route skyline and reconcile for a few
+     * frames so cards do not visibly cascade/stagger back into position.
+     */
+    window.addEventListener(
+        'popstate',
+        () => settleGrid(8)
+    );
+
+    window.addEventListener(
+        'pageshow',
+        e => {
+            if (e.persisted) {
+                settleGrid(8);
+            }
+        }
+    );
+
+    document.addEventListener(
+        'load',
+        scheduleGrid,
+        true
+    );
+
+    /*
+     * No timer/interval: DOM, resize, route changes and short settle bursts
+     * drive updates.
+     */
+    for (const method of ['pushState', 'replaceState']) {
+        const native = history[method];
+        history[method] = function (...args) {
+            const before = location.href;
+            const result = Reflect.apply(native, this, args);
+            if (before !== location.href) scheduleGrid();
+            return result;
+        };
+    }
+    scheduleGrid();
+
+    // --- Side window ---
+    let sideWindow = null;
+
+    // Right edge of the screen, panelWidths.popup percent wide.
+    function sideWindowBounds() {
+        const w =
+            Math.floor(
+                screen.availWidth *
+                panelWidths.popup / 100
+            );
+
+        return {
+            w,
+            h: screen.availHeight,
+            x: (screen.availLeft || 0) + screen.availWidth - w,
+            y: screen.availTop || 0
+        };
+    }
+
+    // Browsers allow this only for windows a script opened as a popup;
+    // when the window opened as a tab, it is silently ignored.
+    function resizeSideWindow() {
+        if (!sideWindow || sideWindow.closed) return;
+        const { w, h, x, y } = sideWindowBounds();
+        try {
+            sideWindow.resizeTo(w, h);
+            sideWindow.moveTo(x, y);
+        } catch (e) {}
+    }
+
+    function openSideWindow(url) {
+        const { w, h, x, y } = sideWindowBounds();
+
+        if (
+            sideWindow &&
+            !sideWindow.closed
+        ) {
+            try {
+                sideWindow.location.href =
+                    url;
+
+                resizeSideWindow();
+                sideWindow.focus();
+
+                return;
+            } catch (e) {
+                sideWindow = null;
+            }
+        }
+
+        sideWindow = window.open(
+            url,
+            'qb_side',
+            `width=${w},height=${h},left=${x},top=${y},menubar=no,toolbar=yes,status=no`
+        );
+
+        if (!sideWindow) {
+            sideWindow =
+                window.open(
+                    url,
+                    'qb_side'
+                );
+        }
+
+        if (!sideWindow) {
+            window.open(
+                url,
+                '_blank'
+            );
+        }
+
+        if (sideWindow) {
+            sideWindow.focus();
+        }
+    }
+
+    function closeSideWindow() {
+        if (
+            sideWindow &&
+            !sideWindow.closed
+        ) {
+            // This window opened it, so it may close it directly. A message
+            // is lost while the panel is loading or on the other X domain.
+            try {
+                sideWindow.close();
+            } catch (e) {}
+
+            if (!sideWindow.closed) {
+                try {
+                    sideWindow.postMessage('xrew_close', '*');
+                } catch (e) {}
+            }
+
+            sideWindow = null;
+        }
+    }
+
+    // --- Split panel: the post opens in this page, right of the timeline ---
+    function createPanel() {
+        gridPanel = document.createElement('div');
+        gridPanel.id = 'xrev-panel';
+
+        const empty = document.createElement('div');
+        empty.className = 'xrev-panel-empty';
+        for (const [name, text] of [
+            ['xrev-panel-idle', 'Click a post to open it here'],
+            ['xrev-panel-busy', 'Loading…']
+        ]) {
+            const message = document.createElement('span');
+            message.className = name;
+            message.textContent = text;
+            empty.appendChild(message);
+        }
+        gridPanel.appendChild(empty);
+
+        // Drag the panel's left edge to resize it.
+        const grip = document.createElement('div');
+        grip.className = 'xrev-panel-grip';
+        grip.title = 'Drag to resize';
+        grip.addEventListener('pointerdown', e => {
+            if (e.button !== 0) return;
+            e.preventDefault();
+            grip.setPointerCapture(e.pointerId);
+            gridPanel.classList.add('xrev-dragging');
+        });
+        grip.addEventListener('pointermove', e => {
+            if (!grip.hasPointerCapture(e.pointerId)) return;
+            const page = document.documentElement.clientWidth;
+            setPanelWidth('split', Math.round((page - e.clientX) / page * 1000) / 10, false);
+        });
+        const endDrag = e => {
+            if (!gridPanel.classList.contains('xrev-dragging')) return;
+            gridPanel.classList.remove('xrev-dragging');
+            if (grip.hasPointerCapture(e.pointerId)) grip.releasePointerCapture(e.pointerId);
+            gridStore.set('split-width', panelWidths.split);
+        };
+        grip.addEventListener('pointerup', endDrag);
+        grip.addEventListener('pointercancel', endDrag);
+        grip.addEventListener('lostpointercapture', endDrag);
+        gridPanel.appendChild(grip);
+
+        placePanel();
+    }
+
+    function placePanel() {
+        const layers = document.getElementById('layers');
+        if (layers?.parentElement && gridPanel.nextSibling === layers) return;
+        // X remounted its shell and dropped the panel with it. A moved frame
+        // reloads as the bare placeholder, so close it instead.
+        if (!gridPanel.isConnected && panelFrame) closePanel();
+        if (layers?.parentElement) {
+            // Never move a loaded post: that would reload the frame.
+            if (!panelFrame || !gridPanel.isConnected) layers.before(gridPanel);
+        } else if (!gridPanel.isConnected) {
+            // Until X mounts #layers; nothing of X's is open yet.
+            document.body.prepend(gridPanel);
+        }
+    }
+
+    let panelLoad = 0;
+
+    /*
+     * Only for the in-page panel. The main page already shows X's Grok and
+     * chat buttons in that corner, and a narrow panel switches X to its
+     * phone layout, which adds a bottom tab bar and floating buttons there.
+     */
+    const panelOnlyCss = `
+            [data-testid="BottomBar"],
+            [data-testid="GrokDrawer"],
+            [data-testid="chat-drawer-root"],
+            [data-testid="DMDrawer"],
+            [data-testid^="FloatingActionButton"] { display: none !important; }
+        `;
+
+    function openPanel(url) {
+        if (!gridPanel) createPanel();
+
+        const target = new URL(url, location.href);
+        if (target.origin !== location.origin) {
+            openSideWindow(url);
+            return;
+        }
+        const path = target.pathname + target.search + target.hash;
+        gridPanel.classList.add('xrev-open');
+        if (panelMinimised) setPanelMinimised(false);
+
+        // Once X runs in the panel, its own router switches posts: no
+        // reload, and X's back arrow in the panel keeps working.
+        try {
+            const frameWindow = panelFrame?.contentWindow;
+            if (frameWindow?.document.querySelector('[data-testid="primaryColumn"]')) {
+                if (frameWindow.location.pathname + frameWindow.location.search !==
+                    target.pathname + target.search) {
+                    frameWindow.history.pushState({}, '', path);
+                    frameWindow.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+                }
+                return;
+            }
+        } catch (e) {}
+
+        loadPanel(path);
+    }
+
+    /*
+     * Signed in, X serves every page with X-Frame-Options: DENY, so a frame
+     * pointed at a post stays blank. /robots.txt may be framed, and a page
+     * written into a frame is never checked against that header: load the
+     * placeholder, then write X's own HTML for the post into it.
+     */
+    function loadPanel(path) {
+        panelFrame?.remove();
+        const load = ++panelLoad;
+        const page = fetch(path, { credentials: 'include' }).then(response => {
+            if (!response.ok) throw new Error('HTTP ' + response.status);
+            return response.text();
+        });
+        page.catch(() => {});
+
+        const frame = panelFrame = document.createElement('iframe');
+        // The placeholder then runs the script's side-panel branch, which
+        // keeps the timeline code out of the panel's window.
+        frame.name = 'qb_side_frame';
+        frame.title = 'Opened post';
+        frame.allow = 'autoplay; fullscreen; clipboard-write; encrypted-media; picture-in-picture';
+        frame.allowFullscreen = true;
+        // No top navigation: the frame can never replace the timeline.
+        frame.setAttribute('sandbox', [
+            'allow-same-origin', 'allow-scripts', 'allow-forms',
+            'allow-popups', 'allow-popups-to-escape-sandbox',
+            'allow-modals', 'allow-downloads', 'allow-presentation'
+        ].join(' '));
+        frame.addEventListener('load', async () => {
+            try {
+                const html = await page;
+                if (load !== panelLoad) return;
+                const doc = frame.contentDocument;
+                doc.open();
+                // Before X's scripts run, so its router starts on the post.
+                frame.contentWindow.history.replaceState(null, '', path);
+                doc.write(html.replace(/<head[^>]*>/i,
+                    head => head + '<style>' + sidePanelCss + panelOnlyCss + '</style>'));
+                doc.close();
+                // document.open dropped the placeholder's listeners.
+                doc.addEventListener('keydown', panelKeydown);
+                markTimerFormat(doc);
+                applyVideoControlClasses(doc.documentElement, 'panel');
+                gridPanel.classList.remove('xrev-loading');
+            } catch (e) {
+                // Never leave a dead panel: fall back to the window.
+                if (load !== panelLoad) return;
+                closePanel();
+                openSideWindow(location.origin + path);
+            }
+        }, { once: true });
+        frame.src = '/robots.txt';
+
+        gridPanel.classList.add('xrev-loading');
+        gridPanel.appendChild(frame);
+    }
+
+    // \ pressed inside the panel reaches its document, not this one.
+    function panelKeydown(e) {
+        if (e.key !== '\\' || e.target instanceof Element && e.target.closest(
+            'input, textarea, [contenteditable="true"], [role="textbox"]'
+        )) return;
+        setPanelMinimised(true);
+    }
+
+    function setPanelMinimised(minimised) {
+        panelMinimised = minimised;
+        gridStore.set('panel-min', minimised ? '1' : '0');
+        document.documentElement.classList.toggle('xrev-panel-min', minimised);
+        if (minimised && panelFrame) {
+            // Hidden is not stopped: pause the post's videos.
+            try {
+                for (const video of panelFrame.contentDocument.querySelectorAll('video')) video.pause();
+            } catch (e) {}
+            // Keys must reach this page again, or \ could not bring it back.
+            if (document.activeElement === panelFrame) {
+                panelFrame.blur();
+                window.focus();
+            }
+        }
+        updatePanelControls();
+        scheduleGrid();
+    }
+
+    function setToolbarMinimised(minimised) {
+        toolbarMinimised = minimised;
+        gridStore.set('toolbar-min', minimised ? '1' : '0');
+        gridToolbar?.classList.toggle('xrev-min', minimised);
+    }
+
+    function closePanel() {
+        panelLoad++;
+        // Removing the frame also stops any video playing in it.
+        panelFrame?.remove();
+        panelFrame = null;
+        gridPanel?.classList.remove('xrev-open', 'xrev-loading');
+    }
+
+    function setOpenMode(mode) {
+        openMode = mode;
+        gridStore.set('open-mode', mode);
+        document.documentElement.classList.toggle('xrev-split', mode === 'split');
+        if (mode !== 'split') closePanel();
+        else if (panelMinimised) setPanelMinimised(false);
+        loadColumnSettings();
+        scheduleGrid();
+    }
+
+    function setPanelWidth(mode, percent, store = true) {
+        panelWidths[mode] = clampPanelWidth(percent);
+        if (store) gridStore.set(mode + '-width', panelWidths[mode]);
+        if (mode === 'split') applySplitWidth();
+        else resizeSideWindow();
+        updatePanelControls();
+    }
+
+    function updatePanelControls() {
+        if (!gridMode) return;
+        const split = openMode === 'split';
+        const width = panelWidths[openMode];
+        const modeLabel = split ? 'split' : 'popup';
+        const modeTitle = split
+            ? 'Posts open beside the timeline in this page; click to open them in a separate window'
+            : 'Posts open in a separate window; click to open them beside the timeline in this page';
+        if (gridMode.textContent !== modeLabel) gridMode.textContent = modeLabel;
+        if (gridMode.title !== modeTitle) {
+            gridMode.title = modeTitle;
+            gridMode.setAttribute('aria-label', modeTitle);
+        }
+        const widthLabel = Math.round(width) + '%';
+        if (gridWidthLabel.textContent !== widthLabel) gridWidthLabel.textContent = widthLabel;
+        const widthTitle = (split
+            ? 'Post panel width, in percent of the page'
+            : 'Post window width, in percent of the screen') +
+            '; click to reset to ' + PANEL_WIDTH_DEFAULT[openMode] + '%';
+        if (gridWidthLabel.title !== widthTitle) {
+            gridWidthLabel.title = widthTitle;
+            gridWidthLabel.setAttribute('aria-label', widthTitle);
+        }
+        gridNarrow.title = split ? 'Narrower post panel' : 'Narrower post window';
+        gridWide.title = split ? 'Wider post panel' : 'Wider post window';
+        gridNarrow.disabled = width <= 20;
+        gridWide.disabled = width >= 80;
+    }
+
+    // --- \ minimises or expands the split panel, or closes the window ---
+    document.addEventListener(
+        'keydown',
+        function (e) {
+            if (e.key === '\\') {
+                const t = e.target instanceof Element ? e.target : document.body;
+
+                if (
+                    t.tagName === 'INPUT' ||
+                    t.tagName === 'TEXTAREA' ||
+                    t.getAttribute(
+                        'contenteditable'
+                    ) === 'true' ||
+                    t.closest(
+                        '[role="textbox"]'
+                    )
+                ) {
+                    return;
+                }
+
+                if (openMode === 'split') setPanelMinimised(!panelMinimised);
+                else closeSideWindow();
+            }
+        }
+    );
+
+    // Playback clicks inside a quote must not open that quote or reach a
+    // second native toggle. Keep the native button and its accessible label;
+    // video play/pause events still update X's controls normally.
+    document.addEventListener('click', e => {
+        if (!(e.target instanceof Element)) return;
+        const button = e.target.closest('button, [role="button"]');
+        const player = button?.closest('[data-testid="videoPlayer"]');
+        if (!player || button.getAttribute('aria-disabled') === 'true' || button.disabled) return;
+        const testID = button.getAttribute('data-testid') || '';
+        const label = button.getAttribute('aria-label') || '';
+        if (!/^videoControl(?:Play|Pause)Button$/.test(testID) &&
+            !/^(?:play|pause)(?: video)?$/i.test(label)) return;
+        const video = player.querySelector('video');
+        // X attaches the stream only when its own player starts a video.
+        // Quoted videos do not autoplay, so until X has loaded one, play()
+        // here did nothing and kept X from loading it: let X take the click.
+        if (!video || !video.currentSrc && !video.getAttribute('src') &&
+            !video.querySelector('source[src]')) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        if (video.paused || video.ended) {
+            const playing = video.play();
+            if (playing?.catch) playing.catch(() => {});
+        } else video.pause();
+    }, true);
+
+    /*
+     * --- Quoted posts ---
+     * A quote is a div[role=link] with no link or ID in the DOM: X opens it
+     * from its own click handler. The quoted post's ID is in X's API data
+     * for the quoting post, so index that as X receives it and look the
+     * quote up by the ID of the post around it.
+     */
+    const quoteTargets = new Map();
+    const QUOTE_TARGET_LIMIT = 5000;
+
+    function indexQuotes(node, depth = 0) {
+        if (!node || typeof node !== 'object' || depth > 80) return;
+        if (Array.isArray(node)) {
+            for (const item of node) indexQuotes(item, depth + 1);
+            return;
+        }
+        const quoted = node.legacy?.quoted_status_id_str;
+        if (typeof node.rest_id === 'string' && /^\d+$/.test(quoted || '')) {
+            let path = '/i/web/status/' + quoted;
+            try {
+                // Gives the author's handle: twitter.com/<handle>/status/<id>.
+                const permalink = new URL(node.legacy.quoted_status_permalink.expanded).pathname;
+                if (permalink.endsWith('/status/' + quoted)) path = permalink;
+            } catch (e) {}
+            quoteTargets.delete(node.rest_id);
+            quoteTargets.set(node.rest_id, path);
+            if (quoteTargets.size > QUOTE_TARGET_LIMIT) {
+                quoteTargets.delete(quoteTargets.keys().next().value);
+            }
+        }
+        for (const key in node) {
+            const value = node[key];
+            if (value && typeof value === 'object') indexQuotes(value, depth + 1);
+        }
+    }
+
+    const isApiUrl = url => /^https:\/\/(?:[\w-]+\.)?(?:x|twitter)\.com\/i\/api\//.test(url || '');
+
+    // X has not loaded yet at document-start, so it picks up these wrappers.
+    const nativeFetch = window.fetch;
+    window.fetch = function (...args) {
+        const result = Reflect.apply(nativeFetch, this, args);
+        result.then(response => {
+            if (isApiUrl(response.url) &&
+                /json/.test(response.headers.get('content-type') || '')) {
+                response.clone().text().then(text => {
+                    if (text.includes('quoted_status_id_str')) indexQuotes(JSON.parse(text));
+                }).catch(() => {});
+            }
+        }, () => {});
+        return result;
+    };
+
+    const nativeSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function (...args) {
+        this.addEventListener('load', () => {
+            if (!isApiUrl(this.responseURL)) return;
+            try {
+                if (this.responseType === 'json') indexQuotes(this.response);
+                else if (!this.responseType || this.responseType === 'text') {
+                    if (this.responseText.length < 8e6 &&
+                        this.responseText.includes('quoted_status_id_str')) {
+                        indexQuotes(JSON.parse(this.responseText));
+                    }
+                }
+            } catch (e) {}
+        });
+        return Reflect.apply(nativeSend, this, args);
+    };
+
+    /*
+     * Split mode keeps the timeline in place: account and post links in it
+     * open in the panel. That covers avatars, names, @mentions, "reposted"
+     * and "Replying to" lines, "Show more",
+     * hover cards (followers, following) and "Who to follow" accounts.
+     * Returns the link's URL, or '' to leave the click to X.
+     */
+    function panelLinkUrl(target) {
+        const scope = target.closest(
+            'article[data-testid="tweet"], [data-testid="HoverCard"], ' +
+            '[data-testid="UserCell"], [data-testid="cellInnerDiv"]'
+        );
+        if (!scope) return '';
+        let link = target.closest('a[href]');
+        // Tabs switch the page's own timeline (Posts, Replies, Media).
+        if (link?.closest('[role="tab"], [role="tablist"], nav')) return '';
+        // A photo opens X's full-size viewer over this page, everywhere
+        // (single photos and galleries). Only the photo itself: the rest of
+        // each post still opens here.
+        if (photoAt(target)) return '';
+        if (!link) {
+            // X opens an account row from a click anywhere on it, except
+            // on its own buttons, such as Follow.
+            const cell = target.closest('[data-testid="UserCell"]');
+            const control = target.closest('button, [role="button"]');
+            if (!cell || control && control !== cell && cell.contains(control)) return '';
+            link = [...cell.querySelectorAll('a[href]')].find(a => panelPath(a));
+        }
+        return link ? panelPath(link) : '';
+    }
+
+    // Same-site links under an account handle; X's own top-level pages
+    // (explore, settings, /i/...) and other sites keep their behaviour.
+    function panelPath(link) {
+        const url = new URL(link.href, location.href);
+        if (url.origin !== location.origin) return '';
+        const first = url.pathname.split('/')[1] || '';
+        return /^\w{1,15}$/.test(first) && !RESERVED_ROUTES.has(first.toLowerCase())
+            ? url.href : '';
+    }
+
+    /*
+     * The photo under a click. X lays a transparent layer over each photo,
+     * inside its /photo/<n> link but beside tweetPhoto, so most clicks land
+     * there: matching tweetPhoto alone sent those to the panel as a plain
+     * link, opening the viewer squeezed inside it. Returns the photo or
+     * its link.
+     */
+    function photoAt(target) {
+        const photo = target.closest('[data-testid="tweetPhoto"]');
+        if (photo) return photo;
+        const link = target.closest('a[href*="/status/"]');
+        return link?.querySelector('[data-testid="tweetPhoto"]') ? link : null;
+    }
+
+    // Returns the quoted post's URL, or '' to leave the click to X.
+    function quotedPostUrl(target) {
+        const quote = target.closest('div[role="link"]');
+        const article = quote?.closest('article[data-testid="tweet"]');
+        if (!article || !quote.querySelector('[data-testid="User-Name"]')) return '';
+        // Media, links and controls inside the quote keep X's behaviour.
+        const control = target.closest(
+            'a, button, [role="button"], video, [data-testid="tweetPhoto"], ' +
+            '[data-testid="videoPlayer"], [data-testid="card.wrapper"]'
+        );
+        if (control && quote.contains(control)) return '';
+        // The quote's own time is not a link, so this is the outer post.
+        const outer = article.querySelector('a[href*="/status/"] time')?.closest('a')
+            ?.getAttribute('href')?.match(/\/status\/(\d+)/)?.[1];
+        const path = outer && quoteTargets.get(outer);
+        return path ? location.origin + path : '';
+    }
+
+    // --- Click tweet body → side window ---
+    document.addEventListener(
+        'click',
+        function (e) {
+            if (!(e.target instanceof Element)) return;
+
+            if (e.button === 0 && !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey &&
+                !window.getSelection()?.toString()) {
+                const quoted = quotedPostUrl(e.target);
+                if (quoted) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    if (openMode === 'split') openPanel(quoted);
+                    else openSideWindow(quoted);
+                    return;
+                }
+
+                const linked = openMode === 'split' && panelLinkUrl(e.target);
+                if (linked) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    openPanel(linked);
+                    return;
+                }
+            }
+
+            if (
+                e.target.closest(
+                    '[data-testid^="UserAvatar-Container"], [data-testid="User-Name"]'
+                )
+            ) {
+                return;
+            }
+
+            if (
+                e.target.closest(
+                    'a, button, [role="button"], [role="link"], video, img, ' +
+                    '[data-testid="like"], [data-testid="unlike"], ' +
+                    '[data-testid="retweet"], [data-testid="unretweet"], ' +
+                    '[data-testid="reply"], [data-testid="bookmark"], ' +
+                    '[data-testid="caret"], [data-testid="tweetPhoto"], ' +
+                    '[data-testid="videoPlayer"]'
+                )
+            ) {
+                return;
+            }
+
+            const article =
+                e.target.closest(
+                    'article[data-testid="tweet"]'
+                );
+
+            if (!article || e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey || window.getSelection()?.toString()) return;
+
+            const timeLink =
+                article.querySelector(
+                    'a[href*="/status/"] time'
+                );
+
+            const link =
+                timeLink?.closest('a');
+
+            if (!link) return;
+
+            e.preventDefault();
+            e.stopPropagation();
+
+            if (openMode === 'split') openPanel(link.href);
+            else openSideWindow(link.href);
+        },
+        true
+    );
+
+    // --- Nav flush left + timeline flush to nav ---
+    let railFixed = null;
+
+    function fixLayout() {
+        const header =
+            document.querySelector(
+                'header[role="banner"]'
+            );
+
+        if (header) {
+            // Find the fixed rail once; reading every div's computed style
+            // on each layout pass forced a style recalculation each time.
+            if (!railFixed || !header.contains(railFixed)) {
+                railFixed = [...header.querySelectorAll('div')].find(
+                    div => getComputedStyle(div).position === 'fixed'
+                ) || null;
+            }
+
+            if (railFixed) {
+                for (const [name, value] of [
+                    ['left', '0px'],
+                    ['width', '68px'],
+                    ['right', 'auto']
+                ]) {
+                    if (railFixed.style.getPropertyValue(name) !== value ||
+                        railFixed.style.getPropertyPriority(name) !== 'important') {
+                        railFixed.style.setProperty(name, value, 'important');
+                    }
+                }
+            }
+
+            /*
+             * Never resize an arbitrary ancestor: it can also contain main.
+             */
+        }
+
+        // Shift timeline flush to nav using transform
+        const primary =
+            document.querySelector(
+                '[data-testid="primaryColumn"]'
+            );
+
+        if (!primary) return;
+
+        if (gridEnabled) {
+            /*
+             * Wide layout is CSS-defined from the first paint. Drop any
+             * translateX left over from the non-grid layout: an inline
+             * !important transform would beat the stylesheet's `none`.
+             */
+            if (/^translateX\(/.test(primary.style.transform)) {
+                primary.style.removeProperty('transform');
+            }
+            return;
+        }
+
+        const navRight = 68;
+
+        const rect =
+            primary.getBoundingClientRect();
+
+        const offset =
+            rect.left -
+            navRight;
+
+        if (
+            Math.abs(offset) >
+            2
+        ) {
+            const current =
+                parseFloat(
+                    primary.style.transform
+                        ?.replace(
+                            /translateX\((.+)px\)/,
+                            '$1'
+                        )
+                ) || 0;
+
+            primary.style.setProperty(
+                'transform',
+                `translateX(${current - offset}px)`,
+                'important'
+            );
+        }
+    }
+
+    // --- Right-click ghost link (skip profile area) ---
+    let ghostLink = null;
+
+    document.addEventListener(
+        'pointerdown',
+        function (e) {
+            if (e.button !== 2) {
+                removeGhost();
+                return;
+            }
+
+            if (
+                e.target.closest(
+                    '[data-testid^="UserAvatar-Container"], [data-testid="User-Name"]'
+                )
+            ) {
+                removeGhost();
+                return;
+            }
+
+            const article =
+                e.target.closest(
+                    'article[data-testid="tweet"]'
+                );
+
+            if (!article) {
+                removeGhost();
+                return;
+            }
+
+            const timeLink =
+                article.querySelector(
+                    'a[href*="/status/"] time'
+                );
+
+            const link =
+                timeLink?.closest('a');
+
+            if (!link) {
+                removeGhost();
+                return;
+            }
+
+            if (!ghostLink) {
+                ghostLink =
+                    document.createElement('a');
+
+                ghostLink.id =
+                    'qb-ghost-link';
+
+                document.body.appendChild(
+                    ghostLink
+                );
+            }
+
+            ghostLink.href =
+                link.href;
+
+            // The browser's own context menu hit-tests this link, so it
+            // offers the post's link actions. A synthetic event cannot.
+            ghostLink.style.cssText =
+                `position:fixed;left:${e.clientX}px;top:${e.clientY}px;width:1px;height:1px;pointer-events:auto;opacity:0;z-index:99999999;`;
+        },
+        true
+    );
+
+    // Once the menu has opened, the link must not catch a later click.
+    document.addEventListener(
+        'contextmenu',
+        () => setTimeout(removeGhost, 0),
+        true
+    );
+
+    document.addEventListener(
+        'keydown',
+        e => {
+            if (e.key === 'Escape') removeGhost();
+        },
+        true
+    );
+
+    function removeGhost() {
+        if (ghostLink) {
+            ghostLink.style.cssText =
+                'position:fixed;width:1px;height:1px;pointer-events:none;opacity:0;z-index:-1;';
+        }
+    }
+
+    document.addEventListener(
+        'click',
+        removeGhost
+    );
+
+    document.addEventListener(
+        'scroll',
+        removeGhost
+    );
+
+    // Layout updates are driven by DOM, resize and route changes above.
+    }
+
+    // Also used by a copy that stops at startup, before any of the
+    // stylesheets exist, so it is styled inline.
+    function showDuplicateWarning() {
+        if (!document.body) {
+            document.addEventListener('DOMContentLoaded', showDuplicateWarning, { once: true });
+            return;
+        }
+        // Function property: a let here would not exist yet at startup.
+        if (showDuplicateWarning.hidden || document.getElementById('xrev-duplicate')) return;
+        const warning = document.createElement('button');
+        warning.type = 'button';
+        warning.id = 'xrev-duplicate';
+        warning.textContent = 'xrev is installed more than once. Keep only the newest copy ' +
+            'enabled in Tampermonkey, then reload. (Click to hide.)';
+        warning.style.cssText = 'position:fixed;right:100px;bottom:70px;z-index:1001;' +
+            'max-width:340px;padding:10px 14px;border:0;border-radius:14px;' +
+            'background:#f4212e;color:#fff;font:13px/1.35 system-ui,sans-serif;' +
+            'text-align:left;cursor:pointer;box-shadow:0 2px 12px #0005';
+        warning.addEventListener('click', () => {
+            showDuplicateWarning.hidden = true;
+            warning.remove();
+        });
+        document.body.appendChild(warning);
+    }
+})();

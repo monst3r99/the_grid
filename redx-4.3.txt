@@ -1,0 +1,2560 @@
+// ==UserScript==
+// @name         redx
+// @namespace    http://tampermonkey.net/
+// @version      4.3
+// @description  Masonry wall of the live Reddit feed with the real post cards, posts opened beside the wall in a resizable split panel or a popup window, adjustable columns, and a bottom-right toolbar — the xrev layout for Reddit. \ (or Alt+G) turns the wall off / on, Esc hides the panel; both keys editable.
+// @author       You
+// @match        https://www.reddit.com/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+/*
+ *  redx — the xrev (X / Twitter) workflow on Reddit. Forked from gridv2
+ *  3.5.15; the gridv2 history below is kept for reference (its notes
+ *  were renamed along with the code, so "redx" there means gridv2).
+ *
+ *  v4.3
+ *    • the popup came back at the top left (its size was right): while
+ *      a window closes Chrome reports its position as 0,0, and 4.2 saved
+ *      that reading on close. Now nothing is saved on close, a position
+ *      is kept only when two readings a second apart agree, and a saved
+ *      0,0 (left over from 4.2) counts as unknown: saved size, right
+ *      edge, until the popup has been somewhere real.
+ *
+ *  v4.2
+ *    • Reddit's own video player fits its card. Its compact control bar
+ *      is written as @media (max-width: 325px) — meant for embeds, where
+ *      the window is the player — so on the wide wall a 150–300 px
+ *      player kept the full bar: settings and fullscreen ran off the
+ *      right edge, captions slid under volume (measured on the user's
+ *      r/ChatGPT save at 6 cols). Those rules are now copied into each
+ *      player as @container rules on the player's own width, giving
+ *      Reddit's small-player bar: play · time · fullscreen · volume.
+ *    • the popup's place and size stick even when the popup's own copy
+ *      of the script doesn't run: the wall's page now tracks the window
+ *      it opened, once a second, and moves / resizes a new one into the
+ *      saved spot right after opening it.
+ *
+ *  v4.1
+ *    • \ turns the wall off and on (like the redx button and Alt+G),
+ *      from the wall or from inside the panel. Hiding the split panel
+ *      / closing the popup moved to Esc — only when Reddit didn't
+ *      already use that Esc to close its search or a menu.
+ *    • "keys" on the toolbar opens a small editor for both keys: click
+ *      one, press the new key; Backspace leaves it unset.
+ *    • the popup window opens exactly where, and as big as, the last
+ *      one was when it closed (it saves its own place and size). The
+ *      − / + / % width buttons still put it at the right edge.
+ *    • players fit the card: in wide columns a portrait clip's player
+ *      (RedGIFs embeds, Reddit's own) was taller than the 340 px media
+ *      cap and its bottom — play / sound / seek controls — got cut
+ *      off. The player is now narrowed until all of it fits, centred.
+ *
+ *  v4.0 — fork.
+ *    • toolbar at the bottom right, like xrev: redx (on/off, also Alt+G)
+ *      · − N cols + (clicking the count returns to automatic fitting)
+ *      · split / popup · − NN% + (panel or window width, 20–80 % in
+ *      5 % steps; clicking the % resets it) · clips N · snap · rec · »
+ *      (minimise; ‹ in the same spot brings it back). Hidden on pages
+ *      with no feed. The 30 px strip under Reddit's header is gone.
+ *    • the wall is on by default and remembers on/off, open mode,
+ *      columns (per mode, auto or manual), both widths, a minimised
+ *      panel and a minimised toolbar (localStorage, keys redx-*). It
+ *      steps aside on its own on pages without a feed (a post, the
+ *      settings) and comes back with the feed.
+ *    • split mode: posts open in a panel on the right, below Reddit's
+ *      header; the wall shrinks to the left and repacks. Drag the
+ *      panel's left edge to resize it. \ minimises / expands it (the
+ *      post stays loaded, its videos pause; \ works inside the panel
+ *      too). Opening a post expands it. No close button. Empty, it
+ *      says "Click a post to open it here".
+ *    • popup mode: posts open in one reused window at the right edge
+ *      of the screen, NN % of its width; changing the % resizes it
+ *      live. \ closes it.
+ *    • click routing (no modifier keys, no text selected): a post's
+ *      body, title, picture or comment count opens the post. In split
+ *      mode, r/ and u/ links inside cards open in the panel too; in
+ *      popup mode they still open in this page. Votes, share, awards,
+ *      Join, the … menu, gallery arrows, video controls and outside
+ *      links stay Reddit's. Ctrl / Shift / middle click still give a
+ *      new tab. Reddit's own client-side jump to a post is routed the
+ *      same way. The image + comments overlay of gridv2 is gone.
+ *    • a second enabled copy of redx, or gridv2 running alongside it,
+ *      shows a red warning instead of two layouts fighting.
+ *    • from gridv2 3.5.15, unchanged: the wall itself, handle line,
+ *      spill-proof packing, action-row fix, live-feed tracking after a
+ *      sort change, embed parking and the clip cap with hover to play,
+ *      Reddit's search over the wall, snap / rec / redxStats() /
+ *      redxDump().
+ *    • fixed on the way (from gridv2 3.5.8): a card whose credit bar has
+ *      no … menu lost its subreddit / date line — the handle line
+ *      squeezed it to zero width. It now always wraps below.
+ *
+ *  ── gridv2 history ──────────────────────────────────────────────
+ *
+ *  v3.5.15 — the stacking bug, for real.
+ *    • changing sort (Hot ⇄ Top › All time) makes Reddit add a second
+ *      <shreddit-feed> while the old one lingers. getFeed() took the
+ *      first one in the page, so the script kept packing the stale
+ *      feed (the user's snaps on /r/rearpussy/ Hot still held the Top
+ *      › All time posts) and every card of the feed actually on screen
+ *      sat unplaced at left:0 / top:0 — the pile of cards in the top
+ *      left with their vote rows peeking out, the hovered one on top.
+ *      Now the wall is the newest feed whose container is showing; it
+ *      gets .redx-feed and every wall rule hangs off that class. Any
+ *      other feed is hidden while the grid is on and its clips are
+ *      parked (hidden iframes keep playing). A new feed appearing, or
+ *      the wall's feed being removed, moves the wall within ~150 ms.
+ *    • a card the packer hasn't placed yet is kept invisible instead of
+ *      sitting at (0,0) on top of the first card.
+ *    • snap info, redxStats() and rec now list how many feeds exist.
+ *
+ *  v3.5.14 — clip cap on screen too, and a glitch recorder.
+ *    • the user's two snaps (3.5.12 and 3.5.13) had a clean layout:
+ *      no overlaps, nothing drawn past a card's border. The glitch is
+ *      the graphics chip falling behind, not the page. 8 columns put
+ *      14–16 clips on screen and 3.5.13 still had 33 live, while the
+ *      iGPU decodes ~9–12 cleanly. So the cap now covers on-screen
+ *      clips as well: the clip under the mouse first, then the ones
+ *      nearest the middle of the view, then off-screen ones. Clips
+ *      past the cap get a "hover to play" cover; hovering one plays
+ *      it. Toolbar "clips N" cycles 4/6/8/10/12/16/24 (default 10).
+ *    • "rec" on the toolbar (or redxRec()) watches for up to 60 s and
+ *      downloads a log of whatever went wrong: cards overlapping,
+ *      spilling or out of place, clip / post / heap counts, slow
+ *      frames and the scripts behind them — plus a snap taken at the
+ *      first layout problem.
+ *
+ *  v3.5.13 — the embed budget actually catches every embed.
+ *    • Reddit builds an embed in stages (loader → shreddit-embed →
+ *      iframe). A card first looked at during the loader stage was
+ *      cached as "no embed" for good, so its clip never got parked —
+ *      the 3.5.12 snap showed 37 embeds live against a budget of 12.
+ *      That's the RAM climb and the GPU smearing that kept coming
+ *      back as you scrolled. Cards without an iframe yet are now
+ *      re-checked (at most once a second) while they look like
+ *      they'll get one.
+ *    • snap files are much smaller: Reddit's shared component styles
+ *      are stored once instead of copied into each of ~600 shadow
+ *      roots (the first real snap was 62 MB).
+ *
+ *  v3.5.12 — snap.
+ *    • a "snap" button on the toolbar (or redxSnap() in the console)
+ *      saves just the cards on screen — max 16 — to one small .html
+ *      file, with their shadow roots, the page's CSS, and a table of
+ *      every element's measured box and key styles. Embeds and videos
+ *      are kept but not loaded. Made for when SingleFile chokes on the
+ *      whole feed. Nothing else changed from 3.5.11.
+ *
+ *  v3.5.11 — no more piled-up cards.
+ *    • in narrow columns (8 cols ≈ 170px) the vote / comments / share
+ *      row wraps to three lines, but Reddit keeps it in a fixed-height
+ *      box inside a closed shadow root. The extra lines spilled out
+ *      under the card's border, the packer placed the next card on top
+ *      of them, and cards stacked up on each other — only their black
+ *      embeds and vote rows peeking out, reshuffling on every repack.
+ *      The packer now measures the spill too and stretches the tile's
+ *      border around it.
+ *    • the (inline) tile min-height this sets is cleared when the grid
+ *      is turned off.
+ *
+ *  v3.5.10 — memory.
+ *    • embeds are budgeted the way grid3x does it. Each RedGIFs embed
+ *      is its own page; redx kept every one Reddit loaded alive, so
+ *      RAM climbed with every batch and too many clips at once
+ *      swamped the iGPU — the smeared, repeated action buttons. Now
+ *      the embeds on screen stay live, the nearest off-screen ones
+ *      fill up to 12, and the rest sit on about:blank until you
+ *      scroll back to them (they reload then). Turning the grid off
+ *      hands them back lazily.
+ *    • far less repacking. Any DOM change inside any card used to
+ *      trigger a full repack of the wall; now only posts arriving or
+ *      leaving do, and a resize only counts if a card's height
+ *      really changed. The handle is no longer moved to the end of
+ *      the credit bar on every pass (CSS order already puts it there).
+ *    • redxStats() in the console prints what the script has been
+ *      doing since the last call (repacks/s, observer callbacks/s,
+ *      live vs parked embeds, JS heap). Run it twice ~10 s apart.
+ *
+ *  v3.5.9
+ *    • arrow-key / hjkl / Home / End navigation is gone, and so is the
+ *      orange highlight on the selected tile. Arrow keys are Reddit's
+ *      again. Clicking a post still remembers it (invisibly) so Enter /
+ *      o and the panel's ‹ › keep working.
+ *    • Reddit's header, search bar and its suggestion dropdown draw
+ *      over the wall and the toolbar, so searching no longer means
+ *      turning the grid off first. The comments panel still sits above
+ *      the header on the right.
+ *    • the action-row fix is stricter. It used to tag every flex box
+ *      between the vote / comment / share / award controls and the
+ *      ancestor they all share; one control living somewhere else in a
+ *      card (inside a video player, or an awards strip on old top-of-
+ *      all-time posts) pushed that ancestor up to the whole card, and
+ *      the whole card's layout got rewritten. Now controls inside the
+ *      media / player are ignored, award-button no longer decides
+ *      where the row is, and the climb stops at any box that holds the
+ *      media or title or is much taller than a button row — if the row
+ *      can't be found that way, the card is left native.
+ *    • redxDump(n) in the console copies a short report of tile n's
+ *      action row (0 = first tile) to the clipboard, for when a card
+ *      still looks wrong and the page is too big to save.
+ *
+ *  v3.5.8
+ *    • left-click no longer pops the image + comments panel. Clicking a
+ *      card body (title, picture, comment count) just selects the tile;
+ *      Reddit still doesn't get the click, so it doesn't navigate away
+ *      or open its own lightbox. Enter still opens the panel, o still
+ *      opens a new tab, and vote / share / … / links work as before.
+ *    • the poster handle sits on a line of its own under the credit
+ *      bar, below the subreddit, the date and the … menu, instead of
+ *      squeezing in between them. The script always places its own
+ *      u/handle as the last item of the bar and hides Reddit's inline
+ *      one (and the • beside it) so it never shows twice.
+ *
+ *  v3.5.7 — visual pass.
+ *    • share no longer gets clipped in narrow columns. Reddit draws the
+ *      action row (vote · comments · award · share) inside shreddit-
+ *      post's shadow root as a nowrap, overflow-hidden flex row, out of
+ *      reach of page CSS. Each tile's row is found by walking up from
+ *      its controls, tagged, and a shared sheet adopted into those
+ *      shadow roots lets it wrap. Narrow columns also drop the "Share"
+ *      label (the icon stays), hide the Join pill and step the title
+ *      down a size.
+ *    • the column count is capped by what fits (MIN_COLW), so a high
+ *      count on a narrow window no longer runs the last column off
+ *      the right edge. The toolbar shows the count actually in use.
+ *    • tiles are placed with top/left, not transform. A transformed
+ *      tile traps Reddit's popups: fixed-position menus land in the
+ *      wrong place and the next tile paints over them. A hovered or
+ *      focused tile is also lifted above its neighbours.
+ *    • tiles get a hairline border, and the wall follows Reddit's
+ *      theme tokens, so light mode no longer puts dark text on black.
+ *    • long words and URLs wrap instead of spilling into the next
+ *      column; subreddit names truncate the way handles do.
+ *    • stable scrollbar gutter, header re-measured on resize, panel
+ *      capped at 60vw on small windows. The script also stays out of
+ *      the comments iframe: \ pressed in there used to build a second
+ *      wall inside the panel. \ and Esc in there now close the panel.
+ *
+ *  v3.5 — same cards as 3.4, but the layout is now true masonry.
+ *
+ *  THE FIX.  3.4 used CSS grid. grid-auto-rows sizes every row to its
+ *  tallest card, so a short card beside a long one leaves dead space
+ *  underneath — the ragged holes you wanted gone. CSS can't pack around
+ *  that. So the grid is gone. Tiles are absolutely positioned by a small
+ *  packer (lifted from gridv3): it measures each card and drops it into
+ *  whichever column is shortest at that moment. Columns stay flush; the
+ *  only empty space left on the wall is the ragged bottom edge.
+ *
+ *  Everything that made redx redx is untouched:
+ *    • native cards — credit bar, flair, title, body, vote buttons,
+ *      comment count, share, award, overflow menu all still render and
+ *      still work; the click handler only claims the card body.
+ *    • poster handle always visible — CSS un-collapses Reddit's byline,
+ *      and ensureHandle() appends one off the `author` attribute when the
+ *      home feed renders none.
+ *    • text posts, polls and bare links keep their tile (this is not the
+ *      media-only wall — that's gridv3).
+ *    • document-start + forced-open shadow roots, faceplate flattening,
+ *      ad + promoted removal, native lightbox killer, pushState guard,
+ *      image viewer + comments iframe, toolbar, toasts, scroll memory.
+ *
+ *  Two consequences of going absolute, both handled the gridv3 way:
+ *    • the feed's content collapses to zero height once every card is
+ *      out of flow, so a 1px scroll spacer sized to the packed height
+ *      gives the container something to scroll.
+ *    • 3.4 hid every non-article child with display:none, sentinel
+ *      included — and a display:none element never trips Reddit's
+ *      load-more IntersectionObserver. Here the junk is parked at the
+ *      foot of the wall at 1px / zero opacity instead: invisible, still
+ *      loadable. Measuring heights also means defeating Reddit's
+ *      content-visibility:auto (it reports the placeholder size, not the
+ *      real one) and un-lazying the feed images so heights settle.
+ */
+
+(function () {
+    'use strict';
+
+    /* ══ A second copy ════════════════════════════════════════════
+       Two enabled copies (or gridv2 alongside redx) each pack the same
+       cards their own way and each claim every click. Run once, and say
+       why. Styled inline: it can run before any stylesheet exists. */
+    function showDuplicateWarning(what) {
+        if (!document.body) {
+            document.addEventListener('DOMContentLoaded', () => showDuplicateWarning(what), { once: true });
+            return;
+        }
+        if (showDuplicateWarning.hidden || document.getElementById('redx-duplicate')) return;
+        const w = document.createElement('button');
+        w.type = 'button';
+        w.id = 'redx-duplicate';
+        w.textContent = what + ' Keep only the newest redx enabled in Tampermonkey, then reload. (Click to hide.)';
+        w.style.cssText = 'position:fixed;right:16px;bottom:70px;z-index:2147483000;max-width:340px;' +
+            'padding:10px 14px;border:0;border-radius:14px;background:#e0282e;color:#fff;' +
+            'font:13px/1.35 system-ui,sans-serif;text-align:left;cursor:pointer;box-shadow:0 2px 12px #0005';
+        w.addEventListener('click', () => { showDuplicateWarning.hidden = true; w.remove(); });
+        document.body.appendChild(w);
+    }
+
+    /* ══ Inside the split panel or the popup window ═══════════════
+       Both show Reddit too, so the script loads in there as well, but
+       a wall in there would bury the post. All it does is hand \ back:
+       in the split panel that minimises the panel; in the popup it
+       closes the window. The popup also closes when the wall asks. */
+    /* ══ Keys (editable from the toolbar's "keys" button) ══════════
+       wall:  turns the wall off and on (default \)
+       panel: hides / shows the split panel, or closes the popup window
+              (default Esc — only when Reddit didn't already use it)
+       Saved as redx-key-wall / redx-key-panel; '' means no key. Read
+       fresh on every press, so the panel and the popup, which run
+       their own copy of the script, follow a change straight away. */
+    const KEY_DEFAULTS = { wall: '\\', panel: 'Escape' };
+    function readKey(name) {
+        try { const v = localStorage.getItem('redx-key-' + name); return v === null ? KEY_DEFAULTS[name] : v; }
+        catch (_) { return KEY_DEFAULTS[name]; }
+    }
+    function keyIs(e, name) {
+        const k = readKey(name);
+        if (!k || e.ctrlKey || e.metaKey || e.altKey) return false;
+        return e.key === k || (k.length === 1 && e.key.toLowerCase() === k.toLowerCase());
+    }
+    function keyLabel(k) {
+        if (!k) return '—';
+        if (k === ' ') return 'Space';
+        if (k === 'Escape') return 'Esc';
+        return k.length === 1 ? k.toUpperCase() : k;
+    }
+    function typingIn(e) {
+        const t = e.composedPath()[0] || e.target;
+        return !!(t?.isContentEditable || t?.matches?.('input, textarea, select, [contenteditable], [role="textbox"]'));
+    }
+
+    /* ══ Inside the split panel or the popup window ═══════════════
+       Both show Reddit too, so the script loads in there as well, but
+       a wall in there would bury the post. In the split panel it hands
+       the two keys back to the wall. The popup closes on the panel key
+       or when the wall asks, and keeps its place and size saved
+       (redx-popup-bounds), so the next one opens exactly there. */
+    if (window.top !== window || window.name === 'redx_side') {
+        const inFrame = window.top !== window;
+        window.addEventListener('keydown', e => {
+            if (e.defaultPrevented || typingIn(e)) return;
+            if (inFrame) {
+                const what = keyIs(e, 'wall') ? 'wall-toggle' : keyIs(e, 'panel') ? 'panel-min' : null;
+                if (what) { try { window.parent.postMessage({ redx: what }, location.origin); } catch (_) {} }
+            } else if (keyIs(e, 'panel')) window.close();
+        });
+        if (!inFrame) {
+            window.addEventListener('message', e => {
+                if (e.source === window.opener && e.origin === location.origin && e.data?.redx === 'close') window.close();
+            });
+            /* Moving a window fires no event, so look once a second, and
+               keep a reading only when two in a row agree. 4.3: while a
+               window closes, Chrome reports its position as 0,0 (size
+               still right) — 4.2 saved that on pagehide, so every new
+               popup came back at the top left. No save on close now, and
+               a one-off reading is never kept. */
+            let prev = '', saved = '';
+            const saveBounds = () => {
+                const b = JSON.stringify({ x: window.screenX, y: window.screenY, w: window.innerWidth, h: window.innerHeight,
+                                           ow: window.outerWidth, oh: window.outerHeight });
+                const stable = b === prev;
+                prev = b;
+                if (!stable || b === saved || window.innerWidth < 200) return;
+                saved = b;
+                try { localStorage.setItem('redx-popup-bounds', b); } catch (_) {}
+            };
+            setInterval(saveBounds, 1000);
+        }
+        return;
+    }
+
+    if (window._redxLoaded) { showDuplicateWarning('redx is installed more than once.'); return; }
+    if (window._gridv2Loaded) { showDuplicateWarning('gridv2 is also enabled — redx replaces it.'); return; }
+    window._redxLoaded = true;
+
+    /* ══ Config ═══════════════════════════════════════════════════ */
+    const MIN_COLS    = 1;
+    const MAX_COLS    = 12;
+    const MIN_COLW    = 140;   // narrowest a column may get; caps cols on small windows
+    const COMPACT_W   = 340;   // below this column width, cards go compact
+    const AUTO_COLW   = 300;   // automatic fitting aims for columns about this wide
+    const MEDIA_CAP   = 340;   // cap on in-card media height, px (0 = uncapped)
+    const GAP         = 8;     // gutter + outer padding, px
+    const SCAN_MS     = 2500;  // backstop rescan / repack interval
+    const SOFT_MS     = 120;   // debounce for repacks the page triggers
+    const EAGER       = true;  // load feed images up front, so heights settle
+    const PANEL_WIDTH_DEFAULT = { split: 50, popup: 40 };   // percent
+
+    const LS = {
+        get(k, d) { try { const v = localStorage.getItem('redx-' + k); return v === null ? d : v; } catch (_) { return d; } },
+        set(k, v) { try { localStorage.setItem('redx-' + k, v); } catch (_) {} }
+    };
+    const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+
+    /* settings, like xrev: on/off, open mode, columns per mode (manual or
+       automatic), panel / window width per mode, minimised panel/toolbar */
+    let enabled  = LS.get('enabled', '1') !== '0';
+    let openMode = LS.get('open-mode', 'split') === 'popup' ? 'popup' : 'split';
+    const colKey = k => (openMode === 'split' ? 'split-' : '') + k;
+    let cols, manualCols;
+    function loadColumnSettings() {
+        cols       = clamp(parseInt(LS.get(colKey('columns'), 4), 10) || 4, MIN_COLS, MAX_COLS);
+        manualCols = LS.get(colKey('manual-columns'), '0') === '1';
+    }
+    loadColumnSettings();
+    const clampWidth = p => clamp(Math.round(+p * 10) / 10 || 50, 20, 80);
+    const panelWidths = {
+        split: clampWidth(LS.get('split-width', PANEL_WIDTH_DEFAULT.split)),
+        popup: clampWidth(LS.get('popup-width', PANEL_WIDTH_DEFAULT.popup)),
+    };
+    let panelMin   = LS.get('panel-min', '0') === '1';
+    let toolbarMin = LS.get('toolbar-min', '0') === '1';
+    let selIndex = -1;
+    let savedScroll = 0;
+
+    const isOn    = () => document.documentElement.classList.contains('redx-on');
+    /* 3.5.15: which feed is the wall. Changing sort (Hot → Top › All
+       time and back) makes Reddit add a second <shreddit-feed> while the
+       old one can linger. getFeed() used to take the first in the page,
+       so the script kept packing the stale feed and every card of the
+       one on screen sat unplaced at (0,0) — the stacked pile in the top
+       left. Now the newest feed whose container is actually showing is
+       the wall; it carries .redx-feed, and all wall CSS hangs off that
+       class, so any other feed is simply hidden while the grid is on. */
+    let activeFeed = null;
+    function pickFeed() {
+        const all = [...document.querySelectorAll('shreddit-feed')];
+        if (all.length < 2) return all[0] || null;
+        const shown = all.filter(f => !f.parentElement || f.parentElement.checkVisibility?.() !== false);
+        return (shown.length ? shown : all)[(shown.length ? shown : all).length - 1];
+    }
+    const getFeed = () => (activeFeed && activeFeed.isConnected ? activeFeed : (activeFeed = pickFeed()));
+
+    /* ══ Force every shadow root open ═════════════════════════════
+       Runs before Reddit boots, so shreddit-post internals stay
+       reachable for image lookup. */
+    const _attachShadow = Element.prototype.attachShadow;
+    Element.prototype.attachShadow = function (init) {
+        return _attachShadow.call(this, { ...init, mode: 'open' });
+    };
+
+    /* ══ SPA navigation guard ═════════════════════════════════════
+       Without this, anything Reddit routes internally would replace
+       the feed and drop you out of the grid. */
+    let routeToPanel = null;   // wired up in init()
+    const _push = history.pushState.bind(history);
+    const _repl = history.replaceState.bind(history);
+
+    function interceptNav(url) {
+        if (!isOn() || !url) return false;
+        const raw = String(url);
+        if (!/\/comments\//.test(raw)) return false;   // let r/ and u/ nav through
+        const abs = raw.startsWith('http') ? raw : location.origin + raw;
+        return routeToPanel ? routeToPanel(abs) : true;   // split panel or popup, per the mode
+    }
+    history.pushState    = (s, t, u) => interceptNav(u) ? undefined : _push(s, t, u);
+    history.replaceState = (s, t, u) => interceptNav(u) ? undefined : _repl(s, t, u);
+
+    /* ══ Styles ═══════════════════════════════════════════════════ */
+
+    /* What a tagged action row gets: it may wrap onto a second line,
+       and the fixed one-line height comes off so that line shows. */
+    const ROW_RULES = `
+            flex-wrap: wrap !important;
+            height: auto !important;
+            row-gap: 6px !important;
+            max-width: 100% !important;`;
+
+    /* Shadow roots don't see page CSS, so the action-row rules ride
+       into them on one shared constructable sheet (see fixActionRow).
+       It's filled only while the grid is on, which leaves the tags
+       inert and the native layout untouched once it's off. */
+    const SHADOW_CSS = `
+        [data-rx-row]    { ${ROW_RULES} }
+        [data-rx-unclip] { overflow: visible !important; }`;
+    const SHADOW_COMPACT = `
+        [data-rx-label]  { display: none !important; }`;
+    const shadowSheet = new CSSStyleSheet();
+    let sheetMode = 0;                    // 0 off · 1 on · 2 on + compact
+    function syncShadowSheet(mode) {
+        if (mode === sheetMode) return;
+        sheetMode = mode;
+        shadowSheet.replaceSync(mode ? SHADOW_CSS + (mode === 2 ? SHADOW_COMPACT : '') : '');
+    }
+
+    const CSS = `
+        html.redx-on body { overflow: hidden !important; }
+
+        /* ── the live feed becomes the wall ──────────────────────── *
+         * position:fixed also makes it the containing block for the
+         * tiles, which the packer positions absolutely.             */
+        html.redx-on shreddit-feed.redx-feed {
+            position: fixed !important;
+            top: var(--redx-top, 86px) !important;
+            left: 0 !important; right: 0 !important; bottom: 0 !important;
+            display: block !important;
+            margin: 0 !important; padding: 0 !important;
+            width: auto !important; max-width: none !important;
+            overflow-y: auto !important; overflow-x: hidden !important;
+            overscroll-behavior: contain !important;
+            /* reserve the scrollbar's width up front, so the packer's
+               clientWidth doesn't change under it once the wall grows
+               tall enough to scroll */
+            scrollbar-gutter: stable !important;
+            background: var(--color-neutral-background, #030303) !important;
+            z-index: 100 !important;
+        }
+        /* split mode: the wall gives the panel the right-hand part */
+        html.redx-on.redx-split:not(.redx-panel-min) shreddit-feed.redx-feed {
+            right: var(--redx-split, 50%) !important;
+        }
+
+        /* any other feed (a stale sort Reddit left behind) stays out of
+           sight while the grid is on — see pickFeed() */
+        html.redx-on shreddit-feed:not(.redx-feed) { display: none !important; }
+
+        /* a card the packer hasn't placed yet would sit at (0,0) on top
+           of the first card — keep it invisible until it has a spot.
+           (The packer writes --gx/--gy into the style attribute.) */
+        html.redx-on shreddit-feed.redx-feed article:not([style*="--gx"]) {
+            visibility: hidden !important;
+        }
+
+        /* wrappers dissolve so <article> is a direct child of the feed */
+        html.redx-on shreddit-feed.redx-feed faceplate-batch,
+        html.redx-on shreddit-feed.redx-feed faceplate-tracker { display: contents !important; }
+
+        /* Everything that isn't a card gets parked at the foot of the
+           wall — 1px tall, transparent, untouchable. Not display:none,
+           because Reddit's load-more sentinel lives down here and a
+           hidden element never trips an IntersectionObserver.        */
+        html.redx-on shreddit-feed.redx-feed > *:not(article):not(faceplate-batch):not(faceplate-tracker):not(.redx-ui),
+        html.redx-on shreddit-feed.redx-feed faceplate-batch > *:not(article),
+        html.redx-on shreddit-feed.redx-feed faceplate-tracker > *:not(article) {
+            position: absolute !important;
+            top: var(--redx-tail, 0px) !important; left: 0 !important;
+            width: 100% !important;
+            height: 1px !important; min-height: 0 !important; max-height: 1px !important;
+            margin: 0 !important; padding: 0 !important;
+            overflow: hidden !important;
+            opacity: 0 !important;
+            pointer-events: none !important;
+            z-index: -1 !important;
+        }
+
+        /* the packer's scroll spacer */
+        .redx-spacer { display: none; }
+        html.redx-on shreddit-feed.redx-feed > .redx-spacer {
+            display: block;
+            position: absolute; top: 0; left: 0;
+            width: 1px; opacity: 0; pointer-events: none;
+        }
+
+        /* ── tiles: only the box is placed, chrome is left alone ──── *
+         * --gx / --gy are written by the packer. They're inert while
+         * the grid is off, so switching back leaves no residue.
+         * Placed with top/left, not transform: a transform makes each
+         * tile the containing block for its fixed-position popups
+         * (share and … menus land in the wrong place) and a stacking
+         * context that the next tile paints over.
+         * content-visibility:visible defeats Reddit's :auto so the
+         * packer measures the real height, not the placeholder.      */
+        html.redx-on shreddit-feed.redx-feed article {
+            position: absolute !important;
+            top: var(--gy, 0px) !important; left: var(--gx, 0px) !important;
+            transform: none !important;
+            width: var(--redx-colw, 300px) !important;
+            min-width: 0 !important; max-width: none !important;
+            margin: 0 !important;
+            box-sizing: border-box !important;
+            border: 1px solid var(--color-neutral-border-weak, rgba(255,255,255,.12)) !important;
+            border-radius: 12px !important;
+            overflow-wrap: break-word !important;   /* long URLs wrap, not spill */
+            content-visibility: visible !important;
+            contain-intrinsic-size: auto !important;
+        }
+        html.redx-on shreddit-feed.redx-feed article.redx-skip { display: none !important; }
+        /* an open share / … menu stays above the neighbouring tiles */
+        html.redx-on shreddit-feed.redx-feed article:hover,
+        html.redx-on shreddit-feed.redx-feed article:focus-within { z-index: 3 !important; }
+        html.redx-on shreddit-feed.redx-feed article > shreddit-post {
+            width: 100% !important; max-width: 100% !important;
+            box-sizing: border-box !important;
+            margin: 0 !important;
+            border-radius: 11px !important;   /* sits flush inside the tile's border */
+            cursor: pointer !important;
+            content-visibility: visible !important;
+        }
+
+        /* ── action row: wraps instead of clipping share ──────────── *
+         * fixActionRow() tags the row; these rules cover a row in the
+         * light DOM, SHADOW_CSS carries the same into shadow roots.  */
+        html.redx-on shreddit-feed.redx-feed [data-rx-row]    { ${ROW_RULES} }
+        html.redx-on shreddit-feed.redx-feed [data-rx-unclip] { overflow: visible !important; }
+
+        /* ── compact cards, for narrow columns ───────────────────── */
+        html.redx-on.redx-compact shreddit-feed.redx-feed [data-rx-label],
+        html.redx-on.redx-compact shreddit-feed.redx-feed article shreddit-join-button {
+            display: none !important;
+        }
+        html.redx-on.redx-compact shreddit-feed.redx-feed [slot="title"] {
+            font-size: 15px !important;
+            line-height: 20px !important;
+        }
+
+        /* text-post previews: inline images and code stay inside the tile */
+        html.redx-on shreddit-feed.redx-feed [slot="text-body"] img { max-width: 100% !important; height: auto !important; }
+        html.redx-on shreddit-feed.redx-feed [slot="text-body"] pre { max-width: 100% !important; overflow-x: auto !important; }
+
+        /* ── credit bar: subreddit · date … on top, handle below ──── *
+         * 3.5.8: the bar itself may wrap, but only the handle ever
+         * takes the second line. Everything Reddit put in the bar
+         * stays on the first: the name/date group grows from a zero
+         * basis (so it never forces a wrap; it truncates instead)
+         * and the … menu holds the end. The script's own handle is
+         * the bar's last child at full width, so it drops beneath.  */
+        html.redx-on shreddit-feed.redx-feed [slot="credit-bar"] {
+            flex-wrap: wrap !important;
+            align-items: center !important;
+            min-width: 0 !important;
+            max-width: 100% !important;
+            row-gap: 0 !important;
+        }
+        html.redx-on shreddit-feed.redx-feed [slot="credit-bar"] > * {
+            flex-wrap: nowrap !important;
+            align-items: center !important;
+            min-width: 0 !important;
+            max-width: 100% !important;
+            row-gap: 0 !important;
+        }
+        html.redx-on shreddit-feed.redx-feed [slot="credit-bar"] > :first-child:not(.redx-handle) {
+            flex: 1 1 0 !important;
+            /* 1px, not 0: with no … menu in the bar, 0 + the handle's 100%
+               still fits one line and the handle squeezed this to nothing */
+            min-width: 1px !important;
+            overflow: hidden !important;
+        }
+        /* Reddit's own inline handle (and the • beside it) is marked by
+           ensureHandle() and hidden — the one on the second line
+           replaces it. */
+        html.redx-on shreddit-feed.redx-feed [slot="credit-bar"] .redx-native-hide {
+            display: none !important;
+        }
+        /* the subreddit name keeps its width — the handle gives way
+           first. Only a name too long for the whole bar truncates,
+           so it can't shove the … menu out of the tile. */
+        html.redx-on shreddit-feed.redx-feed [slot="credit-bar"] a[href^="/r/"] {
+            flex-shrink: 0 !important;
+            min-width: 0 !important;
+            max-width: 100% !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+            white-space: nowrap !important;
+        }
+        html.redx-on shreddit-feed.redx-feed [slot="credit-bar"] a[href^="/r/"] > span {
+            min-width: 0 !important;
+            overflow: hidden !important;
+            text-overflow: ellipsis !important;
+        }
+        html.redx-on shreddit-feed.redx-feed [slot="credit-bar"] :is(img, svg, faceplate-img, shreddit-subreddit-icon) {
+            flex-shrink: 0 !important;
+        }
+        /* a compact card may still have no room for name and time on
+           one line, so they flow onto another rather than crushing
+           each other; the … menu still holds the end of the first */
+        html.redx-on.redx-compact shreddit-feed.redx-feed [slot="credit-bar"] > :first-child {
+            flex-wrap: wrap !important;
+        }
+        /* timestamp keeps its place beside the handle */
+        html.redx-on shreddit-feed.redx-feed [slot="credit-bar"] faceplate-timeago,
+        html.redx-on shreddit-feed.redx-feed [slot="credit-bar"] time {
+            white-space: nowrap !important;
+            flex-shrink: 0 !important;
+        }
+        /* … menu rides the end of the same row */
+        html.redx-on shreddit-feed.redx-feed shreddit-post-overflow-menu,
+        html.redx-on shreddit-feed.redx-feed [slot="overflow-menu"],
+        html.redx-on shreddit-feed.redx-feed [slot="credit-bar"] [id*="overflow-menu"] {
+            margin-left: auto !important;
+            margin-top: 0 !important;
+            align-self: center !important;
+            flex-shrink: 0 !important;
+        }
+
+        /* an on-screen clip parked by the clip cap */
+        html.redx-on shreddit-feed.redx-feed article.redx-parked [slot="post-media-container"] {
+            position: relative !important;
+        }
+        html.redx-on shreddit-feed.redx-feed article.redx-parked [slot="post-media-container"]::after {
+            content: "▶ hover to play";
+            position: absolute; inset: 0; z-index: 5;
+            display: flex; align-items: center; justify-content: center;
+            background: rgba(0, 0, 0, .6);
+            color: #bbb; font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            pointer-events: none;
+        }
+
+        /* the handle line under the bar, only ever shown while the grid is on */
+        .redx-handle { display: none; }
+        html.redx-on shreddit-feed.redx-feed .redx-handle {
+            display: block !important;
+            flex: 0 0 100% !important;
+            order: 99 !important;
+            max-width: 100% !important;
+            min-width: 0 !important;
+            margin: 0 0 2px !important;
+            color: var(--color-neutral-content-weak, #818384);
+            font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            text-decoration: none;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        html.redx-on shreddit-feed.redx-feed a.redx-handle:hover {
+            color: var(--color-neutral-content-strong, #d7dadc); text-decoration: underline;
+        }
+
+        /* keep one tall photo from stretching a card out of all proportion */
+        html.redx-on shreddit-feed.redx-feed [slot="post-media-container"] {
+            max-height: var(--redx-media, 340px) !important;
+            overflow: hidden !important;
+        }
+        html.redx-on shreddit-feed.redx-feed [slot="post-media-container"] img,
+        html.redx-on shreddit-feed.redx-feed [slot="post-media-container"] video {
+            max-height: var(--redx-media, 340px) !important;
+            object-fit: contain !important;
+        }
+        /* 4.1: a player (Reddit's own, or a RedGIFs / other embed) is a
+           box shaped by the clip with its controls along the bottom. In a
+           wide column a portrait clip's box is far taller than the cap,
+           and clipping it cut the controls off. fitMedia() measures the
+           box once and stores its width / height as --rx-ar; narrowing it
+           to cap × ratio makes the whole player — controls included — fit
+           under the cap, centred. */
+        /* 4.2: the player's width drives its compact control bar (see
+           fitPlayerControls) */
+        html.redx-on shreddit-feed.redx-feed :is(shreddit-player, shreddit-player-2) {
+            container-type: inline-size !important;
+        }
+        html.redx-on shreddit-feed.redx-feed [slot="post-media-container"] > .redx-fit {
+            max-width: calc(var(--redx-media, 340px) * var(--rx-ar, 1)) !important;
+            margin-left: auto !important;
+            margin-right: auto !important;
+        }
+
+        /* Slim link cards use a light-DOM grid, not named shadow slots.
+           Stack its existing credit, text and thumbnail cells in DOM order. */
+        html.redx-on shreddit-feed.redx-feed shreddit-post[post-type="link"]
+        > .grid:has(> div > [data-testid="post-thumbnail"]) {
+            grid-template-columns: minmax(0, 1fr) !important;
+            grid-template-rows: auto auto auto !important;
+        }
+        html.redx-on shreddit-feed.redx-feed shreddit-post[post-type="link"]
+        > .grid:has(> div > [data-testid="post-thumbnail"]) > div {
+            grid-column: 1 / -1 !important;
+            grid-row: auto !important;
+            min-width: 0 !important;
+        }
+        html.redx-on shreddit-feed.redx-feed shreddit-post[post-type="link"]
+        > .grid > div:has(> [data-testid="post-thumbnail"]) {
+            margin-top: 8px !important;
+        }
+        html.redx-on shreddit-feed.redx-feed shreddit-post[post-type="link"]
+        [data-testid="post-thumbnail"] {
+            width: 100% !important;
+            min-width: 0 !important;
+            max-width: 100% !important;
+            height: auto !important;
+            min-height: 0 !important;
+            max-height: none !important;
+            aspect-ratio: auto !important;
+        }
+        html.redx-on shreddit-feed.redx-feed shreddit-post[post-type="link"]
+        [data-testid="post-thumbnail"] > a {
+            display: block !important;
+            width: 100% !important;
+            height: auto !important;
+        }
+        html.redx-on shreddit-feed.redx-feed shreddit-post[post-type="link"]
+        [data-testid="post-thumbnail"] > a > img {
+            display: block !important;
+            width: 100% !important;
+            height: auto !important;
+            min-width: 0 !important;
+            min-height: 0 !important;
+            max-width: 100% !important;
+            max-height: var(--redx-media, 340px) !important;
+            object-fit: contain !important;
+            object-position: center !important;
+        }
+
+        /* ── ads, promoted posts, native lightbox ────────────────── */
+        html.redx-on shreddit-feed.redx-feed shreddit-ad-post,
+        html.redx-on shreddit-feed.redx-feed article:has(shreddit-ad-post),
+        html.redx-on shreddit-feed.redx-feed shreddit-post[is-promoted],
+        html.redx-on shreddit-media-lightbox { display: none !important; }
+
+        /* ── chrome that would sit behind the wall ───────────────── */
+        html.redx-on #left-sidebar-container,
+        html.redx-on [data-testid="left-sidebar"],
+        html.redx-on #right-sidebar-container,
+        html.redx-on [data-testid="right-sidebar-container"],
+        html.redx-on pdp-right-rail,
+        html.redx-on .sidebar-grid,
+        html.redx-on reddit-sidebar-nav,
+        html.redx-on #left-sidebar, html.redx-on .left-sidebar,
+        html.redx-on .right-sidebar,
+        html.redx-on shreddit-discovery-unit,
+        html.redx-on shreddit-feed.redx-feed shreddit-recently-visited,
+        html.redx-on shreddit-recently-visited-snoovatar,
+        html.redx-on .recently-visited-main,
+        html.redx-on shreddit-best-of-community,
+        html.redx-on shreddit-top-communities,
+        html.redx-on shreddit-popular-communities,
+        html.redx-on shreddit-related-communities { display: none !important; }
+
+        /* ── Reddit's header over the wall ────────────────────────── *
+         * The search box's suggestion dropdown hangs below the header,
+         * over the wall and the panel. liftHeader() tags the header's
+         * positioned boxes; stacking order is
+         * wall 100 < split panel 10010 < header 10050 < toolbar 10070
+         * < toast.                                                    */
+        html.redx-on [data-rx-top] { z-index: 10050 !important; }
+
+        /* ── toolbar, bottom right (the xrev one) ─────────────────── */
+        #redx-toolbar {
+            position: fixed;
+            right: 16px;
+            bottom: 16px;
+            z-index: 10070;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            padding: 6px;
+            border: 1px solid var(--color-neutral-border, #3e4142);
+            border-radius: 24px;
+            background: var(--color-neutral-background-strong, #1a1a1b);
+            color: var(--color-neutral-content-strong, #d7dadc);
+            font: 13px system-ui, -apple-system, "Segoe UI", sans-serif;
+            box-shadow: 0 2px 12px #0006;
+            user-select: none;
+        }
+        #redx-toolbar[hidden] { display: none; }
+        #redx-toolbar button {
+            border: 0;
+            border-radius: 18px;
+            padding: 7px 11px;
+            background: var(--color-secondary-background, #2a3236);
+            color: inherit;
+            cursor: pointer;
+            font: inherit;
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+        }
+        #redx-toolbar button:hover { background: var(--color-secondary-background-hover, #333d42); }
+        #redx-toolbar button:focus-visible { outline: 2px solid #ff4500; outline-offset: 2px; }
+        #redx-toolbar button:disabled { opacity: .4; cursor: default; }
+        #redx-toolbar [aria-pressed="true"] { background: #ff4500; color: #fff; }
+        #redx-toolbar [aria-pressed="true"]:hover { background: #ff5714; }
+        #redx-toolbar button.redx-recording { background: #b3261e; color: #fff; }
+        #redx-toolbar .redx-sep {
+            align-self: stretch;
+            width: 1px;
+            margin: 3px 2px;
+            background: var(--color-neutral-border, #3e4142);
+        }
+        /* the key editor sits just above the toolbar's right end */
+        #redx-toolbar .redx-keybox {
+            position: absolute;
+            right: 0;
+            bottom: calc(100% + 8px);
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            min-width: 250px;
+            padding: 10px 12px;
+            border: 1px solid var(--color-neutral-border, #3e4142);
+            border-radius: 14px;
+            background: var(--color-neutral-background-strong, #1a1a1b);
+            box-shadow: 0 2px 12px #0006;
+        }
+        #redx-toolbar .redx-keybox[hidden] { display: none; }
+        #redx-toolbar .redx-keyrow {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+        #redx-toolbar .redx-keycap { min-width: 64px; padding: 5px 10px; font-weight: 600; }
+        #redx-toolbar .redx-keyhint {
+            color: var(--color-neutral-content-weak, #8ba2ad);
+            font-size: 12px;
+        }
+        /* minimised: only ‹, the same size and in the same spot as the »
+           that minimised it; the empty frame lets clicks through */
+        #redx-toolbar .redx-expand { display: none; }
+        #redx-toolbar.redx-min {
+            border-color: transparent;
+            background: transparent;
+            box-shadow: none;
+            pointer-events: none;
+        }
+        #redx-toolbar.redx-min > * { display: none; }
+        #redx-toolbar.redx-min > .redx-expand {
+            display: flex;
+            box-shadow: 0 2px 8px #0006;
+            pointer-events: auto;
+        }
+        #redx-toolbar .redx-arrow {
+            align-items: center;
+            justify-content: center;
+            width: 32px;
+            height: 32px;
+            padding: 0;
+            border-radius: 50%;
+            font-size: 22px;
+            line-height: 1;
+        }
+        #redx-toolbar:not(.redx-min) .redx-minimise { display: inline-flex; }
+        #redx-toolbar .redx-expand { font-size: 26px; }
+        #redx-toolbar .redx-arrow > span { display: block; margin-top: -2px; }
+        #redx-toolbar.redx-min > .redx-expand > span { margin-top: -4px; }
+
+        /* ── split panel ─────────────────────────────────────────── *
+         * Right of the wall, below Reddit's header (so search and the
+         * account menu stay usable), above the wall.                 */
+        #redx-panel {
+            display: none;
+            position: fixed;
+            top: var(--redx-header, 56px);
+            right: 0;
+            bottom: 0;
+            width: var(--redx-split, 50%);
+            z-index: 10010;
+            border-left: 1px solid var(--color-neutral-border, #3e4142);
+            background: var(--color-neutral-background, #0b1416);
+            box-sizing: border-box;
+        }
+        /* minimised, the panel is hidden but keeps its post loaded */
+        html.redx-on.redx-split:not(.redx-panel-min) #redx-panel { display: block; }
+        /* Reddit's own header would show again inside the panel: the
+           frame starts one header-height higher, so it sits out of view */
+        #redx-panel .redx-panel-clip {
+            position: absolute;
+            inset: 0;
+            overflow: hidden;
+        }
+        #redx-panel iframe {
+            position: absolute;
+            left: 0;
+            top: calc(-1 * var(--redx-header, 56px));
+            width: 100%;
+            height: calc(100% + var(--redx-header, 56px));
+            border: 0;
+            background: transparent;
+        }
+        #redx-panel.redx-dragging iframe { pointer-events: none; }
+        #redx-panel .redx-panel-empty {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            color: var(--color-neutral-content-weak, #8ba2ad);
+            font: 15px system-ui, -apple-system, "Segoe UI", sans-serif;
+            text-align: center;
+            pointer-events: none;
+        }
+        #redx-panel.redx-open .redx-panel-empty { display: none; }
+        #redx-panel.redx-open.redx-loading .redx-panel-empty { display: flex; }
+        #redx-panel.redx-loading iframe { visibility: hidden; }
+        #redx-panel .redx-panel-busy,
+        #redx-panel.redx-loading .redx-panel-idle { display: none; }
+        #redx-panel.redx-loading .redx-panel-busy { display: inline; }
+        #redx-panel .redx-panel-grip {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            left: -4px;
+            z-index: 2;
+            width: 8px;
+            cursor: col-resize;
+            touch-action: none;
+        }
+
+        /* ── toast, centred over the wall ────────────────────────── */
+        .redx-toast {
+            position: fixed;
+            top: calc(var(--redx-header, 56px) + 10px);
+            left: 50%; transform: translateX(-50%);
+            background: #1a1a1b; color: #ccc;
+            padding: 6px 14px; border: 1px solid #333; border-radius: 6px;
+            z-index: 99999; pointer-events: none;
+            font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            opacity: 0; transition: opacity .2s;
+        }
+        html.redx-on.redx-split:not(.redx-panel-min) .redx-toast { left: calc((100% - var(--redx-split, 50%)) / 2); }
+        .redx-toast.show { opacity: 1; }
+    `;
+
+    (document.head || document.documentElement).appendChild(
+        Object.assign(document.createElement('style'), { textContent: CSS })
+    );
+
+    /* ══ Wait for <body> (we start at document-start) ═════════════ */
+    function onReady(fn) {
+        if (document.body) return fn();
+        new MutationObserver((_, mo) => {
+            if (!document.body) return;
+            mo.disconnect();
+            fn();
+        }).observe(document.documentElement, { childList: true });
+    }
+
+    onReady(function init() {
+
+        const root = document.documentElement;
+
+        /* ── layout vars ─────────────────────────────────────────── */
+        function measureHeader() {
+            for (const s of ['reddit-header-large', 'shreddit-header', '#header', 'header[role="banner"]', 'header']) {
+                const el = document.querySelector(s);
+                if (el?.offsetHeight) return el.offsetHeight;
+            }
+            return 56;
+        }
+        /* Raise the header (and the search inside it) above the wall.
+           Only positioned boxes take a z-index, so tag the header, its
+           positioned ancestors and its own <header>; never an ancestor
+           that also holds the feed, or the wall would be lifted with it. */
+        const HEADER_SEL = 'reddit-header-large, shreddit-header, header[role="banner"], reddit-search-large, faceplate-search-input';
+        let lifted = [];
+        function liftHeader() {
+            lifted.forEach(el => el.removeAttribute('data-rx-top'));
+            lifted = [];
+            const feed = getFeed();
+            const cand = new Set();
+            for (const el of document.querySelectorAll(HEADER_SEL)) {
+                if (feed && (feed.contains(el) || el.contains(feed))) continue;
+                for (let a = el; a && a !== document.body && a !== root; a = a.parentElement) {
+                    if (feed && a.contains(feed)) break;
+                    cand.add(a);
+                }
+                el.querySelectorAll('header').forEach(h => cand.add(h));
+                el.shadowRoot?.querySelectorAll('header').forEach(h => cand.add(h));
+            }
+            for (const el of cand) {
+                if (getComputedStyle(el).position === 'static') continue;
+                el.setAttribute('data-rx-top', '');
+                lifted.push(el);
+            }
+        }
+
+        function measureLayout() {
+            liftHeader();
+            const hh = measureHeader();
+            root.style.setProperty('--redx-header', hh + 'px');
+            root.style.setProperty('--redx-top', hh + 'px');   // the wall starts right under the header
+        }
+        root.style.setProperty('--redx-media', MEDIA_CAP ? MEDIA_CAP + 'px' : 'none');
+        function applySplitWidth() { root.style.setProperty('--redx-split', panelWidths.split + '%'); }
+        applySplitWidth();
+        root.classList.toggle('redx-split', openMode === 'split');
+        root.classList.toggle('redx-panel-min', panelMin);
+
+        /* ── toast ───────────────────────────────────────────────── */
+        const toast = document.createElement('div');
+        toast.className = 'redx-toast redx-ui';
+        document.body.appendChild(toast);
+        let toastTimer;
+        function showToast(msg) {
+            clearTimeout(toastTimer);
+            toast.textContent = msg;
+            toast.classList.add('show');
+            toastTimer = setTimeout(() => toast.classList.remove('show'), 1200);
+        }
+
+        /* ── toolbar, bottom right (as in xrev) ───────────────────── *
+         * ‹ · redx · − N cols + · split/popup · − NN% + · clips · snap ·
+         * rec · ». Hidden on pages with no feed.                       */
+        const toolbar = document.createElement('div');
+        toolbar.id = 'redx-toolbar';
+        toolbar.className = 'redx-ui';
+        toolbar.setAttribute('role', 'group');
+        toolbar.setAttribute('aria-label', 'redx layout');
+        toolbar.hidden = true;
+        const tbButton = (text, title, action) => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.textContent = text;
+            b.title = title;
+            b.setAttribute('aria-label', title);
+            b.addEventListener('click', e => { e.stopPropagation(); action(e); });
+            toolbar.appendChild(b);
+            return b;
+        };
+        const tbSep = () => toolbar.appendChild(Object.assign(document.createElement('span'), { className: 'redx-sep' }));
+        const tbArrow = (b, name) => {
+            const glyph = document.createElement('span');
+            glyph.textContent = b.textContent;
+            b.replaceChildren(glyph);
+            b.classList.add('redx-arrow', name);
+            return b;
+        };
+        tbArrow(tbButton('‹', 'Show the redx toolbar', () => setToolbarMin(false)), 'redx-expand');
+        const toggleBtn = tbButton('redx', 'Turn the wall on or off (Alt+G)', () => setEnabled(!enabled));
+        const lessBtn   = tbButton('−', 'Fewer columns', () => setCols(shownCols - 1));
+        const colLabel  = tbButton('', 'Fit columns automatically', () => setAutoCols());
+        const moreBtn   = tbButton('+', 'More columns', () => setCols(shownCols + 1));
+        tbSep();
+        const modeBtn   = tbButton('', '', () => setOpenMode(openMode === 'split' ? 'popup' : 'split'));
+        const narrowBtn = tbButton('−', '', () => setPanelWidth(openMode, Math.round(panelWidths[openMode] / 5) * 5 - 5));
+        const widthBtn  = tbButton('', '', () => setPanelWidth(openMode, PANEL_WIDTH_DEFAULT[openMode]));
+        const wideBtn   = tbButton('+', '', () => setPanelWidth(openMode, Math.round(panelWidths[openMode] / 5) * 5 + 5));
+        tbSep();
+        const clipsBtn  = tbButton('clips', 'How many clips play at once (click to change)', () => {
+            clipCap = CLIP_CAPS[(CLIP_CAPS.indexOf(clipCap) + 1) % CLIP_CAPS.length];
+            LS.set('clips', clipCap);
+            clipsBtn.textContent = 'clips ' + clipCap;
+            scheduleBudget();
+            showToast(clipCap + ' clips play at once');
+        });
+        tbButton('snap', 'Save the cards on screen to a small .html file, for debugging', () => window.redxSnap());
+        const recBtn    = tbButton('rec', 'Record glitches for up to 60 s, then save a log (click again to stop early)',
+                                   () => (rec ? recStop(true) : recStart()));
+        const keysBtn   = tbButton('keys', 'Change the keys that turn the wall off / on and hide the panel', () => toggleKeyBox());
+        tbArrow(tbButton('»', 'Minimise the toolbar', () => setToolbarMin(true)), 'redx-minimise');
+
+        /* ── key editor (above the toolbar) ───────────────────────── *
+         * Click a key, press the new one; Backspace / Delete leaves it
+         * unset. Stored as redx-key-wall / redx-key-panel.             */
+        const keyBox = document.createElement('div');
+        keyBox.className = 'redx-keybox';
+        keyBox.hidden = true;
+        const keyRows = {};
+        for (const [name, label] of [['wall', 'Wall off / on'], ['panel', 'Hide panel / close popup']]) {
+            const row = document.createElement('div');
+            row.className = 'redx-keyrow';
+            const text = document.createElement('span');
+            text.textContent = label;
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'redx-keycap';
+            btn.addEventListener('click', e => {
+                e.stopPropagation();
+                recordingKey = recordingKey === name ? null : name;
+                updateKeyBox();
+            });
+            row.append(text, btn);
+            keyBox.appendChild(row);
+            keyRows[name] = btn;
+        }
+        const keyHint = document.createElement('div');
+        keyHint.className = 'redx-keyhint';
+        keyHint.textContent = 'Alt+G also turns the wall off / on.';
+        keyBox.appendChild(keyHint);
+        keyBox.addEventListener('click', e => e.stopPropagation());
+        toolbar.appendChild(keyBox);
+        let recordingKey = null;
+        function updateKeyBox() {
+            for (const [name, btn] of Object.entries(keyRows)) {
+                const rec_ = recordingKey === name;
+                btn.textContent = rec_ ? 'press a key…' : keyLabel(readKey(name));
+                btn.setAttribute('aria-pressed', String(rec_));
+                btn.title = rec_ ? 'Press the new key (Backspace: no key; click again to cancel)' : 'Click, then press the new key';
+            }
+            keysBtn.setAttribute('aria-pressed', String(!keyBox.hidden));
+        }
+        function toggleKeyBox(open = keyBox.hidden) {
+            keyBox.hidden = !open;
+            if (!open) recordingKey = null;
+            updateKeyBox();
+        }
+        window.addEventListener('keydown', e => {
+            if (!recordingKey) return;
+            if (['Shift', 'Control', 'Alt', 'Meta', 'CapsLock', 'Tab'].includes(e.key)) return;
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            const value = (e.key === 'Backspace' || e.key === 'Delete') ? '' : e.key;
+            LS.set('key-' + recordingKey, value);
+            showToast(keyLabel(value) === '—' ? 'no key set' : 'key set: ' + keyLabel(value));
+            recordingKey = null;
+            updateKeyBox();
+        }, true);
+        document.addEventListener('click', e => {   // a click anywhere else closes it
+            if (!keyBox.hidden && !e.composedPath().includes(toolbar)) toggleKeyBox(false);
+        }, true);
+        updateKeyBox();
+        toolbar.classList.toggle('redx-min', toolbarMin);
+        document.body.appendChild(toolbar);
+        const countLbl = null;   // gridv2's post count; the xrev toolbar has none
+
+        function setToolbarMin(min) {
+            toolbarMin = min;
+            LS.set('toolbar-min', min ? '1' : '0');
+            toolbar.classList.toggle('redx-min', min);
+        }
+        function updateControls() {
+            toggleBtn.setAttribute('aria-pressed', String(enabled));
+            colLabel.textContent = shownCols + (shownCols === 1 ? ' col' : ' cols');
+            colLabel.setAttribute('aria-pressed', String(manualCols));
+            colLabel.title = manualCols ? 'Fit columns automatically' : 'Columns fit automatically; − / + set them';
+            const split = openMode === 'split';
+            modeBtn.textContent = split ? 'split' : 'popup';
+            modeBtn.title = split
+                ? 'Posts open beside the wall in this page; click to open them in a separate window'
+                : 'Posts open in a separate window; click to open them beside the wall in this page';
+            const w = panelWidths[openMode];
+            widthBtn.textContent = Math.round(w) + '%';
+            widthBtn.title = (split ? 'Post panel width, in percent of the page' : 'Post window width, in percent of the screen') +
+                '; click to reset to ' + PANEL_WIDTH_DEFAULT[openMode] + '%';
+            narrowBtn.title = split ? 'Narrower post panel' : 'Narrower post window';
+            wideBtn.title = split ? 'Wider post panel' : 'Wider post window';
+            narrowBtn.disabled = w <= 20;
+            wideBtn.disabled = w >= 80;
+        }
+
+        /* ── columns ─────────────────────────────────────────────── *
+         * Automatic: as many ~AUTO_COLW columns as fit. Manual: the
+         * saved count, capped by how many MIN_COLW columns fit. Saved
+         * per open mode, since the split panel takes half the width.
+         * `shownCols` is what the wall really uses; − / + step from it. */
+        let shownCols = cols;
+        function fitCols(room) {
+            return clamp(Math.floor((room + GAP) / (MIN_COLW + GAP)), MIN_COLS, MAX_COLS);
+        }
+        function wantedCols(room) {
+            if (!manualCols) return clamp(Math.floor((room + GAP) / (AUTO_COLW + GAP)), MIN_COLS, MAX_COLS);
+            return Math.min(cols, fitCols(room));
+        }
+        function setCols(n) {
+            const feed = getFeed();
+            const fit  = fitCols(Math.max(120, (feed ? feed.clientWidth : window.innerWidth) - GAP * 2));
+            const next = clamp(n, MIN_COLS, fit);
+            if (next === shownCols && manualCols) {
+                if (n > next && next < MAX_COLS) showToast(next + ' cols is the most that fit');
+                return;
+            }
+            cols = next;
+            manualCols = true;
+            LS.set(colKey('columns'), cols);
+            LS.set(colKey('manual-columns'), '1');
+            if (!enabled) setEnabled(true);
+            queueReflow(true);
+            showToast(cols + (cols === 1 ? ' col' : ' cols'));
+        }
+        function setAutoCols() {
+            manualCols = false;
+            LS.set(colKey('manual-columns'), '0');
+            if (!enabled) setEnabled(true);
+            queueReflow(true);
+            showToast('columns fit automatically');
+        }
+
+        /* ── on / off ────────────────────────────────────────────── *
+         * `enabled` is the user's choice (saved). The wall itself is on
+         * only while there's also a feed on the page — syncAuto() turns
+         * it on and off as Reddit navigates.                          */
+        function setEnabled(on) {
+            enabled = on;
+            LS.set('enabled', on ? '1' : '0');
+            syncAuto();
+            updateControls();
+            showToast(on ? 'redx on' : 'redx off');
+        }
+        function syncAuto() {
+            const feed = pickFeed();
+            toolbar.hidden = !feed;
+            if (document.querySelector('.gridv2-toolbar') || document.querySelectorAll('#redx-toolbar').length > 1) {
+                showDuplicateWarning('gridv2 or a second redx is running alongside this one.');
+            }
+            const want = enabled && !!feed;
+            if (want && !isOn()) activate();
+            else if (!want && isOn()) deactivate();
+        }
+
+        /* ── open mode and widths ────────────────────────────────── */
+        function setOpenMode(mode) {
+            openMode = mode;
+            LS.set('open-mode', mode);
+            root.classList.toggle('redx-split', mode === 'split');
+            if (mode !== 'split') clearPanel();
+            else { closeSideWindow(); if (panelMin) setPanelMin(false); }
+            loadColumnSettings();
+            updateControls();
+            queueReflow(true);
+            showToast(mode === 'split' ? 'posts open beside the wall' : 'posts open in a separate window');
+        }
+        function setPanelWidth(mode, percent, store = true) {
+            panelWidths[mode] = clampWidth(percent);
+            if (store) LS.set(mode + '-width', panelWidths[mode]);
+            if (mode === 'split') { applySplitWidth(); queueReflow(true); }
+            else resizeSideWindow();
+            updateControls();
+        }
+
+        /* ── popup window, right edge of the screen ───────────────── */
+        /* 4.1: a new popup opens exactly where, and as big as, the last
+           one was when it closed — the popup saves its own bounds (see
+           the top). Until there are saved bounds, and whenever − / + / %
+           change the width, it sits at the right edge of the screen,
+           NN % wide and full height. */
+        let sideWindow = null;
+        function defaultSideBounds() {
+            const w = Math.floor(screen.availWidth * panelWidths.popup / 100);
+            return { w, h: screen.availHeight, x: (screen.availLeft || 0) + screen.availWidth - w, y: screen.availTop || 0 };
+        }
+        function savedSideBounds() {
+            try {
+                const b = JSON.parse(localStorage.getItem('redx-popup-bounds') || 'null');
+                if (b && b.w >= 200 && b.h >= 200 && Number.isFinite(b.x) && Number.isFinite(b.y)) {
+                    // exactly 0,0 is what 4.2 saved from a closing window: keep the
+                    // size, put it at the right edge until a real spot is saved
+                    if (b.x === 0 && b.y === 0) {
+                        const d = defaultSideBounds();
+                        return { ...b, x: (screen.availLeft || 0) + screen.availWidth - (b.ow || b.w), y: d.y, fresh: true };
+                    }
+                    return b;
+                }
+            } catch (_) {}
+            return null;
+        }
+        // Browsers only allow this for a window a script opened as a popup.
+        function resizeSideWindow() {
+            const b = defaultSideBounds();
+            LS.set('popup-bounds', JSON.stringify(b));   // the width buttons win over the remembered size
+            if (!sideWindow || sideWindow.closed) return;
+            try { sideWindow.resizeTo(b.w, b.h); sideWindow.moveTo(b.x, b.y); } catch (_) {}
+        }
+        function openSideWindow(url) {
+            if (sideWindow && !sideWindow.closed) {
+                try { sideWindow.location.href = url; sideWindow.focus(); if (!sideTimer) trackSideWindow(); return; }
+                catch (_) { sideWindow = null; }
+            }
+            const saved = savedSideBounds();
+            const { w, h, x, y } = saved || defaultSideBounds();
+            sideWindow = window.open(url, 'redx_side', `popup=yes,width=${w},height=${h},left=${x},top=${y},menubar=no,toolbar=yes,status=no`) ||
+                         window.open(url, 'redx_side');
+            if (!sideWindow) { window.open(url, '_blank'); return; }
+            /* 4.2: put it back exactly, frame included — some setups take
+               the open() numbers loosely */
+            if (saved) {
+                try {
+                    sideWindow.moveTo(saved.x, saved.y);
+                    if (saved.ow && saved.oh) sideWindow.resizeTo(saved.ow, saved.oh);
+                } catch (_) {}
+            }
+            sideWindow.focus();
+            trackSideWindow();
+        }
+        /* 4.2: this page also remembers where the popup is, once a second
+           while it's open — the popup's own copy of the script (see the
+           top) may not run in it, and then nothing got saved. */
+        let sideTimer = null;
+        function trackSideWindow() {
+            clearInterval(sideTimer);
+            let prev = '';
+            sideTimer = setInterval(() => {
+                if (!sideWindow || sideWindow.closed) { clearInterval(sideTimer); sideTimer = null; return; }
+                try {
+                    const b = JSON.stringify({ x: sideWindow.screenX, y: sideWindow.screenY, w: sideWindow.innerWidth, h: sideWindow.innerHeight,
+                                               ow: sideWindow.outerWidth, oh: sideWindow.outerHeight });
+                    // only a reading seen twice in a row (a closing window reads 0,0 once)
+                    if (b === prev && sideWindow.innerWidth >= 200 && sideWindow.innerHeight >= 200 && !sideWindow.closed) {
+                        LS.set('popup-bounds', b);
+                    }
+                    prev = b;
+                } catch (_) { prev = ''; }   // mid-navigation, or not reachable — next second
+            }, 1000);
+        }
+        function closeSideWindow() {
+            if (!sideWindow || sideWindow.closed) { sideWindow = null; return; }
+            try { sideWindow.close(); } catch (_) {}
+            if (!sideWindow.closed) { try { sideWindow.postMessage({ redx: 'close' }, location.origin); } catch (_) {} }
+            sideWindow = null;
+        }
+
+        /* ── split panel ─────────────────────────────────────────── *
+         * A fixed panel right of the wall holding one iframe. Reddit can
+         * be framed by itself, so the post page simply loads in it (the
+         * script's copy in there only hands \ back, see the top). The
+         * frame is never moved once loaded — that would reload it. No
+         * close button: \ minimises, opening a post expands.          */
+        const panel = document.createElement('div');
+        panel.id = 'redx-panel';
+        panel.className = 'redx-ui';
+        panel.innerHTML = '<div class="redx-panel-clip"></div>' +
+            '<div class="redx-panel-empty"><span class="redx-panel-idle">Click a post to open it here</span>' +
+            '<span class="redx-panel-busy">Loading…</span></div><div class="redx-panel-grip" title="Drag to resize"></div>';
+        const panelClip = panel.querySelector('.redx-panel-clip');
+        const grip = panel.querySelector('.redx-panel-grip');
+        let panelFrame = null, currentUrl = null;
+        document.body.appendChild(panel);
+
+        grip.addEventListener('pointerdown', e => {
+            if (e.button !== 0) return;
+            e.preventDefault();
+            grip.setPointerCapture(e.pointerId);
+            panel.classList.add('redx-dragging');
+        });
+        grip.addEventListener('pointermove', e => {
+            if (!grip.hasPointerCapture(e.pointerId)) return;
+            const page = root.clientWidth;
+            setPanelWidth('split', Math.round((page - e.clientX) / page * 1000) / 10, false);
+        });
+        const endDrag = e => {
+            if (!panel.classList.contains('redx-dragging')) return;
+            panel.classList.remove('redx-dragging');
+            if (grip.hasPointerCapture(e.pointerId)) grip.releasePointerCapture(e.pointerId);
+            LS.set('split-width', panelWidths.split);
+        };
+        grip.addEventListener('pointerup', endDrag);
+        grip.addEventListener('pointercancel', endDrag);
+        grip.addEventListener('lostpointercapture', endDrag);
+
+        function openPanel(url) {
+            const target = new URL(url, location.href);
+            if (target.origin !== location.origin) { openSideWindow(url); return; }
+            panel.classList.add('redx-open');
+            if (panelMin) setPanelMin(false);
+            /* already showing it? (what the panel shows now — you may have
+               browsed on inside it since) */
+            let showing = currentUrl;
+            try { showing = panelFrame?.contentWindow.location.href || currentUrl; } catch (_) {}
+            if (panelFrame && showing === target.href) return;
+            currentUrl = target.href;
+            panel.dataset.url = target.pathname;   // for redxSnap / debugging
+            if (!panelFrame) {
+                panelFrame = document.createElement('iframe');
+                panelFrame.name = 'redx_side_frame';
+                panelFrame.title = 'Opened post';
+                panelFrame.allow = 'autoplay; fullscreen; clipboard-write; encrypted-media; picture-in-picture';
+                panelFrame.allowFullscreen = true;
+                // no top navigation: the panel can never replace the wall
+                panelFrame.setAttribute('sandbox', ['allow-same-origin', 'allow-scripts', 'allow-forms',
+                    'allow-popups', 'allow-popups-to-escape-sandbox', 'allow-modals', 'allow-downloads',
+                    'allow-presentation'].join(' '));
+                panelFrame.addEventListener('load', () => panel.classList.remove('redx-loading'));
+                panelFrame.src = target.href;
+                panelClip.appendChild(panelFrame);
+            } else {
+                // no history entry per post
+                try { panelFrame.contentWindow.location.replace(target.href); }
+                catch (_) { panelFrame.src = target.href; }
+            }
+            panel.classList.add('redx-loading');
+        }
+        function clearPanel() {
+            panelFrame?.remove();   // removing the frame also stops anything playing in it
+            panelFrame = null;
+            currentUrl = null;
+            panel.classList.remove('redx-open', 'redx-loading');
+        }
+        function pausePanelMedia() {
+            try {
+                const doc = panelFrame?.contentDocument;
+                if (doc) for (const v of deepQuery(doc, 'video')) v.pause();
+            } catch (_) {}
+        }
+        function setPanelMin(min) {
+            panelMin = min;
+            LS.set('panel-min', min ? '1' : '0');
+            root.classList.toggle('redx-panel-min', min);
+            if (min) {
+                pausePanelMedia();   // hidden is not stopped
+                // keys must reach this page again, or \ couldn't bring it back
+                if (document.activeElement === panelFrame) { panelFrame.blur(); window.focus(); }
+            }
+            queueReflow(true);
+        }
+        function openPostUrl(url) {
+            if (!url) return;
+            if (openMode === 'split') openPanel(url); else openSideWindow(url);
+        }
+        window.addEventListener('message', e => {
+            if (e.origin !== location.origin || e.source !== panelFrame?.contentWindow) return;
+            if (e.data?.redx === 'panel-min' && openMode === 'split') setPanelMin(true);
+            else if (e.data?.redx === 'wall-toggle') wallKey();
+        });
+
+        /* ── poster handle ───────────────────────────────────────── *
+         * 3.5.8: the handle gets a line of its own under the credit
+         * bar. The home feed often has no author in the DOM at all,
+         * and where Reddit does print one it's wedged between the
+         * subreddit and the date — so the script always adds its own,
+         * off the `author` attribute, as the bar's last child (the CSS
+         * gives it the full second line) and hides Reddit's inline one.
+         * Runs every reflow: cheap, and Reddit re-renders bars.      */
+        const SEP_RE = /^[•·]$/;
+        const BAR_KEEP = 'time, faceplate-timeago, a[href^="/r/"], shreddit-post-overflow-menu, [slot="overflow-menu"], [id*="overflow-menu"]';
+
+        function hideNativeHandles(bar) {
+            for (const a of bar.querySelectorAll('a[href*="/user/"]:not(.redx-handle)')) {
+                if (a.closest('.redx-native-hide')) continue;
+                /* climb to the widest wrapper that holds only this link,
+                   never the bar or anything with the sub / date / menu */
+                let w = a;
+                const txt = a.textContent.trim();
+                while (w.parentElement && w.parentElement !== bar) {
+                    const p = w.parentElement;
+                    if (p.textContent.trim() !== txt || p.querySelector(BAR_KEEP)) break;
+                    w = p;
+                }
+                w.classList.add('redx-native-hide');
+                /* drop one • so "r/sub • • 3h" / "• 3h" can't dangle */
+                const isSep = el => el && !el.classList.contains('redx-native-hide') &&
+                                    SEP_RE.test(el.textContent.trim());
+                const prev = w.previousElementSibling, next = w.nextElementSibling;
+                if (isSep(prev)) prev.classList.add('redx-native-hide');
+                else if (isSep(next)) next.classList.add('redx-native-hide');
+            }
+        }
+
+        function ensureHandle(post) {
+            if (post.dataset.redxHandle === 'none' || post.hasAttribute('is-promoted')) return;
+
+            const name = post.getAttribute('author');
+            if (!name) { post.dataset.redxHandle = 'none'; return; }
+
+            const bar = post.querySelector('[slot="credit-bar"]');
+            if (!bar) return;                                 // bar not rendered yet — retry next reflow
+
+            hideNativeHandles(bar);
+            /* already there: leave it where it is. CSS order puts it on
+               the last line, so nothing is moved — moving it each pass
+               could fight Reddit over the bar's last child. */
+            if (bar.querySelector(':scope > .redx-handle')) return;
+
+            const deleted = name.startsWith('[');
+            const el = document.createElement(deleted ? 'span' : 'a');
+            el.className = 'redx-handle';
+            el.textContent = 'u/' + name;
+            if (!deleted) {
+                el.href  = '/user/' + name + '/';
+                el.title = 'u/' + name;
+            }
+            bar.appendChild(el);
+            post.dataset.redxHandle = 'added';
+        }
+
+        /* ── action row ──────────────────────────────────────────── *
+         * Reddit builds the row as a one-line, nowrap, overflow-hidden
+         * flex box inside shreddit-post's shadow root, so a narrow
+         * column just clips whatever comes last — share. Class names
+         * churn, so rather than target them, find the row by what's in
+         * it: the nearest flat-tree ancestor two of the controls share.
+         * Row-flex boxes from the controls up to it are tagged
+         * data-rx-row, clipping ones data-rx-unclip, and the share
+         * label data-rx-label. shadowSheet is adopted into every
+         * shadow root a tag lands in, and turns the tags into
+         * wrap / visible / hidden (label only when compact).        */
+        const ROW_CONTROLS = [
+            'shreddit-post-share-button',
+            '[data-action-bar-action]',
+            '[data-post-click-location="vote"]',
+            '[data-post-click-location="comments-button"]',
+            '[data-post-click-location="share"]',
+        ].join(',');
+        /* boxes the row can never be in, nor contain */
+        const MEDIA_TAG = /^(SHREDDIT-PLAYER|SHREDDIT-PLAYER-2|GALLERY-CAROUSEL|SHREDDIT-EMBED|VIDEO)$/;
+        const NOT_ROW   = 'slot[name="post-media-container"], slot[name="title"], [slot="post-media-container"], [slot="title"], shreddit-player, shreddit-player-2, gallery-carousel, video';
+        const inMedia = (c, post) => {
+            for (let el = c; el && el !== post; el = flatParent(el)) {
+                if (MEDIA_TAG.test(el.tagName) || el.getAttribute?.('slot') === 'post-media-container') return true;
+            }
+            return false;
+        };
+        const SHARE_SEL = 'shreddit-post-share-button, [data-action-bar-action="share"], [data-post-click-location="share"]';
+        const SVG_NS    = 'http://www.w3.org/2000/svg';
+        const rowFix    = new WeakMap();   // tile -> { roots, marks, tries, done }
+
+        function adopt(r) {
+            if (!(r instanceof ShadowRoot)) return;
+            if (!r.adoptedStyleSheets.includes(shadowSheet)) {
+                r.adoptedStyleSheets = [...r.adoptedStyleSheets, shadowSheet];
+            }
+        }
+        /* parent in the rendered (flat) tree: a slotted node sits
+           under its slot, a shadow root's top under the host */
+        const flatParent = el => el.assignedSlot || el.parentElement || el.parentNode?.host || null;
+
+        function fixActionRow(tile, post) {
+            let fx = rowFix.get(tile);
+            if (!fx) rowFix.set(tile, fx = { roots: new Set(), marks: [], tries: 0, done: false });
+
+            if (fx.done && fx.marks.every(m => m.isConnected)) {
+                fx.roots.forEach(adopt);   // hydration can swap a root's sheets out
+                return;
+            }
+            if (fx.tries >= 12) return;    // row never showed — leave it be
+            fx.tries++;
+
+            let found = deepQuery(post, ROW_CONTROLS);
+            if (post.shadowRoot) deepQuery(post.shadowRoot, ROW_CONTROLS, found);
+            found = found.filter(c => !inMedia(c, post));   // a player's own share / buttons
+
+            /* flat-tree path from each control up to the post; a
+               control nested in another (a share <a> inside the share
+               element) is dropped. Each path stops at the first box
+               every path runs through — the row. */
+            const ctrls  = new Set(found);
+            const chains = [];
+            for (const c of found) {
+                const chain = [];
+                let nested = false;
+                for (let el = flatParent(c); el && el !== post; el = flatParent(el)) {
+                    if (ctrls.has(el)) { nested = true; break; }
+                    chain.push(el);
+                }
+                if (!nested) chains.push({ c, chain });
+            }
+            /* One control alone has no shared box to stop at, so its
+               climb would run to the post and rewrite the whole card —
+               what a half-hydrated first card used to get. Wait for two. */
+            if (chains.length < 2) return;   // not rendered yet — retry next reflow
+
+            /* a row is about one button tall; anything much taller is
+               card, not row */
+            let ctrlH = 0;
+            for (const { c } of chains) ctrlH = Math.max(ctrlH, c.getBoundingClientRect().height);
+            const rowMax = Math.max(64, ctrlH * 2.5);
+            const isRowBox = el => {
+                if (el.getBoundingClientRect().height > rowMax) return false;
+                if (el.tagName === 'SLOT') return true;
+                return !el.querySelector(NOT_ROW);
+            };
+            const hits = new Map();
+            for (const { chain } of chains) for (const el of chain) hits.set(el, (hits.get(el) || 0) + 1);
+
+            const mark = (el, attr) => {
+                el.setAttribute(attr, '');
+                fx.marks.push(el);
+                fx.roots.add(el.getRootNode());
+            };
+            const done = new Set();
+            for (const { c, chain } of chains) {
+                for (const el of chain) {
+                    if (done.has(el)) break;
+                    if (!isRowBox(el)) break;          // climbed out of the row — stop here
+                    done.add(el);
+                    if (el.tagName !== 'SLOT') {
+                        const cs = getComputedStyle(el);
+                        if (cs.display.includes('flex') && cs.flexDirection.startsWith('row')) mark(el, 'data-rx-row');
+                        if (cs.overflowX !== 'visible') mark(el, 'data-rx-unclip');
+                    }
+                    if (chains.length > 1 && hits.get(el) === chains.length) break;   // shared by all: the row
+                }
+                if (c.matches(SHARE_SEL)) markShareLabel(c, mark);
+            }
+            fx.done = true;
+            fx.roots.forEach(adopt);
+        }
+
+        /* the word on the share button — a leaf that's all letters,
+           not an SVG <title> — so compact cards can show just the icon */
+        function markShareLabel(share, mark) {
+            const els = deepQuery(share, '*');
+            if (share.shadowRoot) deepQuery(share.shadowRoot, '*', els);
+            for (const el of els) {
+                if (el.children.length || el.namespaceURI === SVG_NS) continue;
+                if (/^\p{L}[\p{L} ]{0,15}$/u.test(el.textContent.trim())) mark(el, 'data-rx-label');
+            }
+        }
+
+        /* ── live embed budget (ported from grid3x) ────────────────── *
+         * Every RedGIFs / external embed is an iframe holding its own
+         * document — its own renderer process, memory and video
+         * decode. redx used to keep every one Reddit ever loaded
+         * alive, so RAM climbed with each batch of posts and enough
+         * clips at once swamped the iGPU (the smeared, repeated-button
+         * "mirror" look). Now: embeds rank by nearness to the view (3.5.14: on-screen ones too), the
+         * nearest off-screen ones fill the rest of the clip cap (see updateBudget),
+         * and everything further away is parked on about:blank (src
+         * kept in data-rx-src) until it's scrolled back near.        */
+        const stats = { reflow: 0, ro: 0, mut: 0, blanked: 0, restored: 0, t: performance.now() };
+        const mediaCache = new WeakMap();     // tile -> { frames, mayGain, at }
+
+        /* Reddit builds an embed in stages: an empty
+           <shreddit-async-loader bundlename="embed">, later the
+           <shreddit-embed>, then the iframe. 3.5.10 decided "no embed"
+           once and cached it, so a card first seen at the loader stage
+           was never budgeted — its clip stayed live forever (37 live
+           against a budget of 12 in the 3.5.12 snap). Now a card with
+           no iframe yet is looked at again, at most once a second, for
+           as long as it shows any sign of an embed (cheap light-DOM
+           check first, full shadow walk only then).               */
+        const EMBED_HINT = 'shreddit-embed, shreddit-async-loader[bundlename="embed"], [slot="post-media-container"] iframe';
+        function tileFrames(tile) {
+            const m = mediaCache.get(tile);
+            const now = performance.now();
+            if (m && m.frames.length && m.frames.every(f => f.isConnected)) return m.frames;
+            if (m && !m.frames.length && now - m.at < 1000) return m.frames;
+            const fresh = { frames: [], at: now };
+            const post = tile.querySelector('shreddit-post');
+            const maybe = tile.querySelector(EMBED_HINT) ||
+                          /^(link|video|embed|gif)$/.test(post?.getAttribute('post-type') || '');
+            if (maybe) {
+                for (const el of deepQuery(tile, 'iframe')) fresh.frames.push(el);
+            }
+            mediaCache.set(tile, fresh);
+            return fresh.frames;
+        }
+        function blankFrames(tile) {
+            for (const f of tileFrames(tile)) {
+                const src = f.getAttribute('src');
+                if (!src || src === 'about:blank' || f.dataset.rxSrc) continue;
+                f.dataset.rxSrc = src;
+                f.src = 'about:blank';
+                stats.blanked++;
+            }
+        }
+        function restoreFrames(tile) {
+            for (const f of tileFrames(tile)) {
+                const src = f.dataset.rxSrc;
+                if (!src) continue;
+                delete f.dataset.rxSrc;
+                f.src = src;
+                stats.restored++;
+            }
+        }
+
+        let budgetRaf = 0;
+        function scheduleBudget() {
+            if (budgetRaf || !isOn()) return;
+            budgetRaf = requestAnimationFrame(() => { budgetRaf = 0; if (isOn()) updateBudget(); });
+        }
+        /* 3.5.14: the cap covers on-screen clips too. Eight columns put
+           14–16 embeds on screen, past what the iGPU decodes (~9–12),
+           and the overflow shows up as the smeared / stacked cards.
+           Clips are ranked: the one under the mouse first, then on-screen
+           ones by distance from the middle of the view, then off-screen
+           ones by distance. The first `clipCap` stay live; on-screen
+           ones past the cap get a "hover to play" cover. The toolbar's
+           "clips" button cycles the cap.                               */
+        const CLIP_CAPS = [4, 6, 8, 10, 12, 16, 24];
+        let clipCap = CLIP_CAPS.includes(+LS.get('clips', 10)) ? +LS.get('clips', 10) : 10;
+        let hoverTile = null;
+        clipsBtn.textContent = 'clips ' + clipCap;
+        function updateBudget() {
+            const feed = getFeed();
+            if (!feed) return;
+            const h = feed.clientHeight, top = feed.scrollTop, bottom = top + h, mid = top + h / 2;
+            const list = [];
+            for (const tile of tiles) {
+                const m = meta.get(tile);
+                if (!m || !tileFrames(tile).length) { tile.classList.remove('redx-parked'); continue; }
+                const y1 = m.y + m.h;
+                const vis = y1 >= top && m.y <= bottom;
+                const d = tile === hoverTile ? -1
+                        : vis ? Math.abs(m.y + m.h / 2 - mid)
+                        : h + (y1 < top ? top - y1 : m.y - bottom);
+                list.push({ tile, d, vis });
+            }
+            list.sort((a, b) => a.d - b.d);
+            list.forEach((o, i) => {
+                const keep = i < clipCap;
+                if (keep) restoreFrames(o.tile); else blankFrames(o.tile);
+                o.tile.classList.toggle('redx-parked', !keep && o.vis);
+            });
+        }
+        /* hovering a parked clip plays it (and parks the lowest-ranked one) */
+        function onHover(e) {
+            if (!isOn()) return;
+            const art = e.composedPath().find(el => el?.tagName === 'ARTICLE');
+            if (!art || art === hoverTile || !tiles.includes(art)) return;
+            hoverTile = art;
+            if (art.classList.contains('redx-parked')) updateBudget();   // now, not next frame
+        }
+        window.addEventListener('pointerover', onHover, true);
+        /* grid off: hand the embeds back, but lazily, so a long scroll
+           doesn't reload dozens of them at once */
+        function releaseFrames() {
+            for (const tile of tiles) {
+                for (const f of tileFrames(tile)) {
+                    if (!f.dataset.rxSrc) continue;
+                    f.loading = 'lazy';
+                    f.src = f.dataset.rxSrc;
+                    delete f.dataset.rxSrc;
+                }
+            }
+        }
+
+        /* redxStats(): what the script itself has been doing since the
+           last call — if RAM still climbs while these stay small, it's
+           the page, not the script. */
+        window.redxStats = () => {
+            const now = performance.now(), secs = (now - stats.t) / 1000;
+            let live = 0, parked = 0;
+            for (const t of tiles) for (const f of tileFrames(t)) {
+                if (f.dataset.rxSrc) parked++; else if (f.getAttribute('src') && f.getAttribute('src') !== 'about:blank') live++;
+            }
+            const per = k => (stats[k] / secs).toFixed(1) + '/s';
+            const heap = performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) + ' MB JS heap · ' : '';
+            const txt = `redx 4.3 · over ${secs.toFixed(0)}s · repacks ${per('reflow')} · resize cb ${per('ro')} · mutation cb ${per('mut')}` +
+                        ` · frames parked ${stats.blanked} / restored ${stats.restored}\n` +
+                        `${heap}${document.querySelectorAll('shreddit-feed').length} feeds (switched ${stats.feedSwitches || 0}x) · ${tiles.length} tiles · ${document.querySelectorAll('shreddit-feed article').length} articles · embeds live ${live} · parked ${parked} · videos ${deepQuery(getFeed() || document, 'video').length}`;
+            Object.assign(stats, { reflow: 0, ro: 0, mut: 0, blanked: 0, restored: 0, t: now });
+            console.log(txt);
+            return txt;
+        };
+
+        /* ── snap: save what's on screen ───────────────────────────── *
+         * SingleFile walks the whole page — 200+ posts, every embed and
+         * image — and dies first. Snap takes only the cards on screen
+         * (max 16), synchronously, and downloads one small .html:
+         *   • the cards with their shadow roots written out as
+         *     <template shadowrootmode="open"> (adopted sheets included),
+         *     so they render again offline with the page's CSS;
+         *   • embeds/videos kept, but their src renamed data-src, so the
+         *     file opens instantly and loads nothing heavy;
+         *   • every element tagged data-snap="N", and a layout table
+         *     (#rx-layout: tag, x, y, w, h relative to its card, display,
+         *     position, overflow, height, flex-wrap, contain,
+         *     content-visibility, z-index) as measured live;
+         *   • #rx-info: version, url, window, columns, each card's packer
+         *     numbers and row-fix state, and redxStats().
+         * Registered custom elements with no open shadow root (none at
+         * all, or a closed one the script can't reach) are marked
+         * data-snap-noroot.                                             */
+        const VOID_TAGS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'source', 'track', 'wbr']);
+        const escAttr = s => String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+        const escText = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const sheetText = sh => { try { return [...sh.cssRules].map(r => r.cssText).join('\n'); } catch (_) { return ''; } };
+        const rawEnd = s => s.replace(/<\/(style|script)/gi, '<\\/$1');
+
+        function snapLayout(el, ox, oy) {
+            if (el.namespaceURI === SVG_NS && el.localName !== 'svg') return 0;
+            const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
+            return [el.localName, Math.round(r.left - ox), Math.round(r.top - oy), Math.round(r.width), Math.round(r.height),
+                    cs.display, cs.position, cs.overflowX + '/' + cs.overflowY, cs.height, cs.flexWrap,
+                    cs.contain, cs.contentVisibility, cs.zIndex];
+        }
+        function snapNode(node, ctx) {
+            if (node.nodeType === 3) return escText(node.data);
+            if (node.nodeType !== 1) return '';
+            const el = node, tag = el.localName;
+            if (tag === 'script' || tag === 'noscript') return '';
+            const id = ctx.layout.length;
+            ctx.layout.push(snapLayout(el, ctx.x, ctx.y));
+            let attrs = '';
+            for (const a of el.attributes) {
+                let name = a.name;
+                if (/^on/i.test(name)) continue;
+                if (name === 'src' && /^(iframe|video|source|audio)$/.test(tag)) name = 'data-src';
+                attrs += ` ${name}="${escAttr(a.value)}"`;
+            }
+            attrs += ` data-snap="${id}"`;
+            if (tag.includes('-') && !el.shadowRoot && customElements.get(tag)) attrs += ' data-snap-noroot=""';
+            if (VOID_TAGS.has(tag)) return `<${tag}${attrs}>`;
+
+            let inner = '';
+            if (el.shadowRoot) {
+                /* adopted sheets are shared objects (one per component
+                   type), so store each once and just list its index here
+                   — copying them into every root made a 62 MB snap */
+                const ids = (el.shadowRoot.adoptedStyleSheets || []).map(sh => {
+                    if (!ctx.sheets.has(sh)) ctx.sheets.set(sh, ctx.sheets.size);
+                    return ctx.sheets.get(sh);
+                });
+                inner += '<template shadowrootmode="open">' +
+                         (ids.length ? `<rx-sheets hidden data-ids="${ids.join(',')}"></rx-sheets>` : '');
+                for (const c of el.shadowRoot.childNodes) inner += snapNode(c, ctx);
+                inner += '</template>';
+            }
+            if (tag === 'style') inner += rawEnd(el.textContent);
+            else if (tag === 'template') inner += el.innerHTML;
+            else for (const c of el.childNodes) inner += snapNode(c, ctx);
+            return `<${tag}${attrs}>${inner}</${tag}>`;
+        }
+
+        window.redxSnap = (opts = {}) => {
+            const feed = getFeed();
+            if (!feed || !isOn()) { showToast('turn the grid on first'); return; }
+            const fr = feed.getBoundingClientRect();
+            const vis = tiles.filter(t => {
+                const r = t.getBoundingClientRect();
+                return r.bottom > fr.top && r.top < fr.bottom;
+            }).slice(0, opts.max || 16);
+
+            const ctx = { layout: [], sheets: new Map(), x: 0, y: 0 };
+            const cards = [], cardInfo = [];
+            for (const t of vis) {
+                const r = t.getBoundingClientRect();
+                ctx.x = r.left; ctx.y = r.top;
+                const from = ctx.layout.length;
+                cards.push(snapNode(t, ctx));
+                const fx = rowFix.get(t);
+                cardInfo.push({
+                    index: tiles.indexOf(t), post: t.querySelector('shreddit-post')?.id,
+                    type: t.querySelector('shreddit-post')?.getAttribute('post-type'),
+                    packer: meta.get(t), rect: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
+                    offsetH: t.offsetHeight, scrollH: t.scrollHeight, minH: t.style.minHeight,
+                    rowFix: fx ? { tries: fx.tries, done: fx.done, marks: fx.marks.length } : null,
+                    layout: [from, ctx.layout.length],
+                });
+            }
+            const css = [...document.styleSheets].map(sheetText).join('\n') + '\n' +
+                        (document.adoptedStyleSheets || []).map(sheetText).join('\n');
+            const info = {
+                version: '4.3', url: location.href, when: new Date().toISOString(),
+                window: [innerWidth, innerHeight, devicePixelRatio], cols: shownCols,
+                colW: getComputedStyle(root).getPropertyValue('--redx-colw').trim(),
+                feed: { scrollTop: feed.scrollTop, rect: [fr.left, fr.top, fr.width, fr.height] },
+                rootClass: root.className, tiles: tiles.length, cards: cardInfo,
+                feeds: [...document.querySelectorAll('shreddit-feed')].map(f => ({ wall: f === feed, articles: f.querySelectorAll('article').length, shown: f.parentElement?.checkVisibility?.() ?? null, first: f.querySelector('shreddit-post')?.id || null })),
+                stats: window.redxStats(), ua: navigator.userAgent,
+            };
+            const json = o => JSON.stringify(o).replace(/</g, '\\u003c');
+            const tail = spacer.style.height || '0px';
+            const html = '<!doctype html>\n' +
+                `<html class="${escAttr(root.className)}" style="${escAttr(root.getAttribute('style') || '')}"><head><meta charset="utf-8">` +
+                `<title>redx snap ${info.when}</title><base href="${escAttr(location.origin)}/">` +
+                `<style>${rawEnd(css)}</style></head><body>` +
+                `<shreddit-feed>${cards.join('\n')}<div class="redx-spacer redx-ui" style="height:${tail}"></div></shreddit-feed>` +
+                `<script type="application/json" id="rx-info">${json(info)}</script>` +
+                `<script type="application/json" id="rx-layout">${json(ctx.layout)}</script>` +
+                `<script type="application/json" id="rx-sheets">${json([...ctx.sheets.keys()].map(sheetText))}</script>` +
+                '<script>(function () {' +
+                'var T = JSON.parse(document.getElementById("rx-sheets").textContent).map(function (t) {' +
+                ' var s = new CSSStyleSheet(); try { s.replaceSync(t); } catch (e) {} return s; });' +
+                '(function walk(r) { r.querySelectorAll("*").forEach(function (el) { var sr = el.shadowRoot; if (!sr) return;' +
+                ' var mk = sr.querySelector("rx-sheets"); if (mk) sr.adoptedStyleSheets = mk.dataset.ids.split(",").map(function (i) { return T[i]; });' +
+                ' walk(sr); }); })(document);' +
+                `document.querySelector("shreddit-feed").scrollTop = ${Math.round(feed.scrollTop)};` +
+                '})();</script>' +
+                '</body></html>';
+            if (opts.download === false) return html;
+
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+            a.download = 'redx-snap-' + info.when.replace(/[:.]/g, '-') + '.html';
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+            showToast(`snap: ${vis.length} cards · ${(html.length / 1048576).toFixed(1)} MB`);
+            return a.download;
+        };
+
+        /* ── rec: log glitches over time ──────────────────────────── *
+         * A snap is one instant; the glitch comes and goes. rec samples
+         * four times a second for up to 60 s and logs only what changes
+         * or looks wrong, then downloads redx-rec-<time>.json:
+         *   • overlap — two on-screen cards in a column really overlap
+         *   • spill   — a card draws past its own border
+         *   • moved   — a card isn't where the packer put it
+         *   • count   — posts / live clips / parked clips / heap changed
+         *   • jank    — frames slower than 50 ms (worst one per second),
+         *               plus Chrome's long-animation-frame entries naming
+         *               the scripts that ran
+         * The first overlap / spill / moved also takes a snap, saved
+         * inside the log. Nothing here can see the GPU itself: if the
+         * screen smears while the log stays clean, the page is fine and
+         * it's the graphics chip falling behind.                     */
+        let rec = null;
+        function recLog(type, data) {
+            if (!rec || rec.events.length >= 3000) return;
+            rec.events.push({ t: Math.round(performance.now() - rec.t0), type, ...data });
+        }
+        function recSample() {
+            if (!rec) return;
+            if (performance.now() - rec.t0 > 60000) { recStop(true); return; }
+            const feed = getFeed();
+            if (!feed || !isOn()) return;
+            const fr = feed.getBoundingClientRect(), st = feed.scrollTop;
+            const vis = [];
+            for (const t of tiles) {
+                const m = meta.get(t);
+                if (!m || m.y + m.h < st - 50 || m.y > st + fr.height + 50) continue;
+                const r = t.getBoundingClientRect();
+                vis.push({ t, m, r, id: t.querySelector('shreddit-post')?.id });
+            }
+            let bad = false;
+            for (const v of vis) {
+                const realY = Math.round(v.r.top - fr.top + st), realX = Math.round(v.r.left - fr.left);
+                if (Math.abs(realY - v.m.y) > 1 || Math.abs(realX - v.m.x) > 1) {
+                    if (!rec.seen.has('m' + v.id + realY)) { rec.seen.add('m' + v.id + realY); recLog('moved', { post: v.id, packer: [v.m.x, v.m.y], real: [realX, realY] }); bad = true; }
+                }
+                const painted = v.t.scrollHeight + (v.t.offsetHeight - v.t.clientHeight);
+                if (painted > v.t.offsetHeight + 1 && !rec.seen.has('s' + v.id + painted)) {
+                    rec.seen.add('s' + v.id + painted);
+                    recLog('spill', { post: v.id, box: v.t.offsetHeight, painted, packerH: v.m.h }); bad = true;
+                }
+            }
+            for (const a of vis) for (const b of vis) {
+                if (a === b || Math.abs(a.r.left - b.r.left) > 2 || b.r.top <= a.r.top || b.r.top >= a.r.bottom - 1) continue;
+                const k = 'o' + a.id + b.id + Math.round(b.r.top);
+                if (rec.seen.has(k)) continue;
+                rec.seen.add(k);
+                recLog('overlap', { a: a.id, b: b.id, aRect: [a.r.top, a.r.bottom].map(Math.round), bTop: Math.round(b.r.top), aPacker: [a.m.y, a.m.h], bPacker: b.m.y });
+                bad = true;
+            }
+            if (bad && !rec.snap) { try { rec.snap = window.redxSnap({ download: false }); recLog('snap', { bytes: rec.snap.length }); } catch (x) { recLog('snap-error', { msg: String(x) }); } }
+
+            let live = 0, parked = 0;
+            for (const t of tiles) for (const f of tileFrames(t)) {
+                if (f.dataset.rxSrc) parked++;
+                else if (f.getAttribute('src') && f.getAttribute('src') !== 'about:blank') live++;
+            }
+            const heap = performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : null;
+            const cnt = { feeds: document.querySelectorAll('shreddit-feed').length, tiles: tiles.length, live, parked, onScreen: vis.length, scrollTop: Math.round(st), heapMB: heap };
+            const key = JSON.stringify({ ...cnt, heapMB: heap && Math.round(heap / 10) });   // heap logged in 10 MB steps
+            if (key !== rec.lastCount) { rec.lastCount = key; recLog('count', cnt); }
+
+            if (rec.slowFrames) { recLog('jank', { slowFrames: rec.slowFrames, worstMs: Math.round(rec.worst) }); rec.slowFrames = 0; rec.worst = 0; }
+            recBtn.textContent = 'rec ' + Math.ceil((60000 - (performance.now() - rec.t0)) / 1000) + 's';
+        }
+        function recFrame(now) {
+            if (!rec) return;
+            const gap = now - rec.lastFrame;
+            rec.lastFrame = now;
+            if (gap > 50) { rec.slowFrames++; rec.worst = Math.max(rec.worst, gap); }
+            rec.raf = requestAnimationFrame(recFrame);
+        }
+        function recStart() {
+            if (!isOn()) { showToast('turn the grid on first'); return; }
+            rec = { t0: performance.now(), events: [], seen: new Set(), lastCount: '', snap: null,
+                    slowFrames: 0, worst: 0, lastFrame: performance.now() };
+            recLog('start', { url: location.href, window: [innerWidth, innerHeight, devicePixelRatio], cols: shownCols, clipCap });
+            try {
+                rec.loaf = new PerformanceObserver(list => {
+                    for (const e of list.getEntries()) {
+                        recLog('long-frame', {
+                            ms: Math.round(e.duration), blockingMs: Math.round(e.blockingDuration || 0),
+                            scripts: (e.scripts || []).slice(0, 3).map(s => ({ ms: Math.round(s.duration), src: (s.sourceURL || '').slice(-80), fn: s.sourceFunctionName || s.invoker || '' })),
+                        });
+                    }
+                });
+                rec.loaf.observe({ type: 'long-animation-frame', buffered: false });
+            } catch (_) { rec.loaf = null; }
+            rec.raf = requestAnimationFrame(recFrame);
+            rec.iv = setInterval(recSample, 250);
+            recBtn.classList.add('redx-recording');
+            showToast('recording — click rec to stop (max 60 s)');
+        }
+        function recStop(save) {
+            if (!rec) return;
+            const r = rec;
+            rec = null;
+            clearInterval(r.iv);
+            cancelAnimationFrame(r.raf);
+            r.loaf?.disconnect();
+            recBtn.textContent = 'rec';
+            recBtn.classList.remove('redx-recording');
+            if (!save) return;
+            const types = {};
+            for (const e of r.events) types[e.type] = (types[e.type] || 0) + 1;
+            const out = {
+                version: '4.3', when: new Date().toISOString(), seconds: Math.round((performance.now() - r.t0) / 1000),
+                summary: types, stats: window.redxStats(), events: r.events, snap: r.snap,
+            };
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob([JSON.stringify(out)], { type: 'application/json' }));
+            a.download = 'redx-rec-' + out.when.replace(/[:.]/g, '-') + '.json';
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+            showToast('rec saved · ' + Object.entries(types).map(([k, v]) => k + ' ' + v).join(' · '));
+        }
+        window.redxRec = () => (rec ? recStop(true) : recStart());
+
+        /* ── redxDump(n): action-row report for tile n ─────────── *
+         * For a card that still looks wrong on a page too big to save:
+         * run redxDump(0) in the console (0 = first tile), then paste
+         * what it copies. Read-only.                                 */
+        window.redxDump = (n = 0) => {
+            const tile = tiles[n];
+            const post = tile?.querySelector('shreddit-post');
+            if (!post) return 'no tile ' + n + ' (' + tiles.length + ' tiles)';
+            const desc = el => {
+                if (!el.tagName) return '#shadow-root';
+                const cs = getComputedStyle(el), r = el.getBoundingClientRect();
+                const cls = (el.getAttribute('class') || '').split(/\s+/).slice(0, 6).join('.');
+                const tags = ['data-rx-row', 'data-rx-unclip', 'data-rx-label'].filter(a => el.hasAttribute(a)).map(a => a.slice(8)).join('+');
+                return `${el.tagName.toLowerCase()}${cls ? '.' + cls : ''}` +
+                       ` [${cs.display}${cs.display.includes('flex') ? ' ' + cs.flexDirection + ' ' + cs.flexWrap : ''}` +
+                       ` ov:${cs.overflowX} ${Math.round(r.width)}x${Math.round(r.height)}]${tags ? ' <' + tags + '>' : ''}`;
+            };
+            const out = [`redx 4.3 · tile ${n} · ${post.getAttribute('post-type')} · ${post.id} · ${location.pathname}${location.search}`];
+            const found = deepQuery(post, ROW_CONTROLS);
+            if (post.shadowRoot) deepQuery(post.shadowRoot, ROW_CONTROLS, found);
+            const fx = rowFix.get(tile);
+            out.push(`controls ${found.length} · tries ${fx?.tries ?? 0} · done ${!!fx?.done} · marks ${fx?.marks.length ?? 0}`);
+            for (const c of found) {
+                out.push('', '● ' + (c.getAttribute('data-post-click-location') || c.getAttribute('data-action-bar-action') || '') +
+                         (inMedia(c, post) ? ' (in media, ignored)' : ''));
+                for (let el = c, d = 0; el && el !== post && d < 14; el = flatParent(el), d++) out.push('  ' + desc(el));
+            }
+            const txt = out.join('\n');
+            console.log(txt);
+            navigator.clipboard?.writeText(txt).then(() => console.log('redxDump: copied'), () => {});
+            return txt;
+        };
+
+        /* ══ Which posts belong on the wall ═══════════════════════ *
+         * Everything except ads and promoted posts — text posts and
+         * polls keep their tile, cards stay native.                 */
+        function keep(art) {
+            if (art.querySelector('shreddit-ad-post')) return false;
+            const post = art.querySelector('shreddit-post');
+            if (!post) return false;
+            if (post.hasAttribute('is-promoted') || post.hasAttribute('promoted')) return false;
+            return true;
+        }
+
+        /* players: fit the whole box, controls and all, under the media
+           cap (see the .redx-fit CSS). Measured once, from the box's
+           natural size; retried each repack until the player has one. */
+        const PLAYER_HINT = 'shreddit-player, shreddit-player-2, shreddit-embed, ' +
+            'shreddit-async-loader[bundlename="embed"], video, iframe';
+        /* 4.2: Reddit's player squeezes its control bar for small players
+           with @media (max-width: 325px) rules — written for embeds, where
+           the window IS the player. On the wall the window is wide, so in
+           a 150–300 px card the full bar stayed: settings and fullscreen
+           ran off the right edge and captions slid under volume. Each
+           such rule is copied from the player's own shadow stylesheets as
+           an @container rule (the player is made a size container by the
+           CSS), so a narrow player gets exactly Reddit's compact bar:
+           play · short time · fullscreen · volume. Parts of the player
+           render late, so a player is re-checked for a few repacks. */
+        const containerCopies = new WeakMap();   // CSSStyleSheet -> its @container copy, or null
+        const patchedRoots = new WeakSet();
+        function containerCopy(sheet) {
+            if (containerCopies.has(sheet)) return containerCopies.get(sheet);
+            let css = '';
+            try {
+                for (const r of sheet.cssRules) {
+                    if (!(r instanceof CSSMediaRule)) continue;
+                    const m = /^\(max-width:\s*(\d+(?:\.\d+)?)px\)$/.exec((r.conditionText || r.media.mediaText || '').trim());
+                    if (!m || +m[1] > 700) continue;
+                    css += `@container (max-width: ${m[1]}px) {\n${[...r.cssRules].map(x => x.cssText).join('\n')}\n}\n`;
+                }
+            } catch (_) {}
+            let copy = null;
+            if (css) { try { copy = new CSSStyleSheet(); copy.replaceSync(css); } catch (_) { copy = null; } }
+            containerCopies.set(sheet, copy);
+            return copy;
+        }
+        function patchRoot(root) {
+            if (patchedRoots.has(root)) return;
+            const sheets = [...root.adoptedStyleSheets, ...root.styleSheets];
+            if (!sheets.length) return;                       // not styled yet — next time
+            patchedRoots.add(root);
+            const add = sheets.map(containerCopy).filter(s => s && !root.adoptedStyleSheets.includes(s));
+            if (add.length) root.adoptedStyleSheets = [...root.adoptedStyleSheets, ...add];
+        }
+        function fitPlayerControls(art) {
+            for (const player of art.querySelectorAll('shreddit-player, shreddit-player-2')) {
+                const passes = +(player.dataset.rxCtl || 0);
+                if (passes >= 4 || !player.shadowRoot) continue;
+                patchRoot(player.shadowRoot);
+                for (const r of deepQuery(player.shadowRoot, '*').map(el => el.shadowRoot).filter(Boolean)) patchRoot(r);
+                // count passes only once the control bar exists
+                if (deepQuery(player.shadowRoot, '.control-bar, [class*="control"]').length) player.dataset.rxCtl = passes + 1;
+            }
+        }
+
+        function fitMedia(art) {
+            if (!MEDIA_CAP) return;
+            const box = art.querySelector('[slot="post-media-container"]');
+            const inner = box?.firstElementChild;
+            if (!inner || inner.classList.contains('redx-fit')) return;
+            if (!box.querySelector(PLAYER_HINT)) return;
+            const r = inner.getBoundingClientRect();
+            if (r.width < 40 || r.height <= MEDIA_CAP + 1) return;   // fits already, or not laid out yet
+            inner.style.setProperty('--rx-ar', (r.width / r.height).toFixed(4));
+            inner.classList.add('redx-fit');
+        }
+
+        /* one-time work per card: un-lazy images so the packer isn't
+           measuring 0-height placeholders */
+        function prep(art) {
+            for (const img of art.querySelectorAll('img')) {
+                if (EAGER && img.loading === 'lazy') img.loading = 'eager';
+                if (!img.decoding) img.decoding = 'async';
+            }
+            art.dataset.rxp = '1';
+        }
+
+        /* ══ The packer ═══════════════════════════════════════════ *
+         * Measure every tile, then drop each one into whichever
+         * column is shortest at that moment. Feed order still reads
+         * left to right, but no column waits on its neighbour, so the
+         * only empty space on the wall is the ragged bottom edge.    */
+        const spacer = document.createElement('div');
+        spacer.className = 'redx-spacer redx-ui';
+
+        const meta   = new WeakMap();   // tile -> {x, y, h, col}
+        const seen   = new WeakSet();   // tiles already prepped + observed
+        let tiles    = [];              // feed order, ads/promoted dropped
+        let byColumn = [];              // column index -> tiles, top to bottom
+
+        /* repack only when a card's height really changed — the packer
+           setting a tile's width or position isn't a reason to repack */
+        const ro = new ResizeObserver(entries => {
+            stats.ro++;
+            for (const e of entries) {
+                const m = meta.get(e.target);
+                const h = e.borderBoxSize?.[0]?.blockSize ?? e.target.offsetHeight;
+                if (!m || Math.abs(m.h - h) > 1) { queueReflow(false); return; }
+            }
+        });
+
+        let softTimer = null, rafQueued = false;
+        function queueReflow(now) {
+            if (now) {
+                clearTimeout(softTimer); softTimer = null;
+                if (rafQueued) return;
+                rafQueued = true;
+                requestAnimationFrame(() => { rafQueued = false; if (isOn()) reflow(); });
+                return;
+            }
+            if (softTimer) return;
+            softTimer = setTimeout(() => { softTimer = null; if (isOn()) reflow(); }, SOFT_MS);
+        }
+
+        function collect(feed) {
+            const out = [];
+            for (const art of feed.querySelectorAll('article')) {
+                if (!keep(art)) { art.classList.add('redx-skip'); continue; }
+                art.classList.remove('redx-skip');
+                const post = art.querySelector('shreddit-post');
+                if (post) {
+                    ensureHandle(post);                       // idempotent, retries until placed
+                    fixActionRow(art, post);                  // same
+                    fitMedia(art);                            // same
+                    fitPlayerControls(art);                   // same
+                }
+                if (!seen.has(art)) { seen.add(art); prep(art); ro.observe(art); }
+                out.push(art);
+            }
+            return out;
+        }
+
+        function reflow() {
+            const feed = getFeed();
+            if (!feed) return;
+            if (!feed.classList.contains('redx-feed')) claimFeed(feed);
+            stats.reflow++;
+            if (spacer.parentNode !== feed) feed.appendChild(spacer);
+
+            const gap  = GAP;
+            const pad  = GAP;
+            const room = Math.max(120, feed.clientWidth - pad * 2);
+            const n    = wantedCols(room);
+            const colW = Math.max(60, Math.floor((room - gap * (n - 1)) / n));
+            const left = pad + Math.floor((room - (colW * n + gap * (n - 1))) / 2);   // centre the rounding slack
+
+            if (n !== shownCols) shownCols = n;
+            updateControls();
+
+            /* width and density first, so the tiles collect() tags are
+               measured with the rules that will actually apply */
+            root.style.setProperty('--redx-colw', colW + 'px');
+            const compact = colW < COMPACT_W;
+            root.classList.toggle('redx-compact', compact);
+            syncShadowSheet(compact ? 2 : 1);
+
+            tiles = collect(feed);
+
+            /* 3.5.11: measure what the card really paints, not just its
+               box. In a narrow column the action row wraps to 2–3 lines,
+               but Reddit holds it in a fixed-height box inside a closed
+               shadow root the script can't restyle — so the extra lines
+               spill out under the card's border, the next card was
+               placed on top of them, and cards piled up. scrollHeight
+               counts that spill; the tile then gets a min-height so its
+               border wraps it. Last pass's min-height comes off first,
+               so a card can shrink again (e.g. after − columns).      */
+            for (const t of tiles) if (t.style.minHeight) t.style.minHeight = '';
+            const heights = tiles.map(t => {
+                const box = t.offsetHeight;
+                const painted = t.scrollHeight + (t.offsetHeight - t.clientHeight);   // + borders
+                return painted > box + 1 ? painted : box;
+            });
+            tiles.forEach((t, i) => { if (heights[i] > t.offsetHeight + 1) t.style.minHeight = heights[i] + 'px'; });
+
+            const colH = new Array(n).fill(0);
+            byColumn = Array.from({ length: n }, () => []);
+
+            for (let i = 0; i < tiles.length; i++) {
+                let c = 0;
+                for (let k = 1; k < n; k++) if (colH[k] < colH[c] - 0.5) c = k;
+
+                const y = colH[c] ? colH[c] + gap : pad;
+                const x = left + c * (colW + gap);
+                const t = tiles[i];
+
+                t.style.setProperty('--gx', x + 'px');
+                t.style.setProperty('--gy', y + 'px');
+                meta.set(t, { x, y, h: heights[i], col: c });
+                byColumn[c].push(t);
+                colH[c] = y + heights[i];
+            }
+
+            const tail = Math.max.apply(null, colH.concat(0)) + pad;
+            root.style.setProperty('--redx-tail', tail + 'px');
+            spacer.style.height = tail + 'px';
+            if (countLbl) countLbl.textContent = tiles.length + ' posts';
+            scheduleBudget();
+        }
+
+        /* ── feed watching ───────────────────────────────────────── *
+         * 3.5.10: only posts arriving or leaving repack the wall. Any
+         * other DOM churn inside a card (players, timestamps, vote
+         * animations, hydration) used to set off a full repack too;
+         * a card that actually changes size is caught by `ro`, and the
+         * SCAN_MS sweep catches the rest.                            */
+        const isPostNode = n => n.nodeType === 1 &&
+            (n.tagName === 'ARTICLE' || n.tagName === 'SHREDDIT-POST' || !!n.querySelector?.('article, shreddit-post'));
+        let observedFeed = null, feedObs = null;
+        function watchFeed() {
+            const feed = getFeed();
+            if (!feed || feed === observedFeed) return feed;
+            feedObs?.disconnect();
+            observedFeed?.removeEventListener('scroll', scheduleBudget);
+            observedFeed = feed;
+            feedObs = new MutationObserver(recs => {
+                stats.mut++;
+                for (const r of recs) {
+                    for (const n of r.addedNodes)   if (isPostNode(n)) { queueReflow(false); return; }
+                    for (const n of r.removedNodes) if (isPostNode(n)) { queueReflow(false); return; }
+                }
+            });
+            feedObs.observe(feed, { childList: true, subtree: true });
+            feed.addEventListener('scroll', scheduleBudget, { passive: true });
+            return feed;
+        }
+        /* the wall follows the feed that's on screen (see pickFeed) */
+        function claimFeed(feed) {
+            for (const f of document.querySelectorAll('shreddit-feed.redx-feed')) if (f !== feed) f.classList.remove('redx-feed');
+            if (feed && !feed.classList.contains('redx-feed')) feed.classList.add('redx-feed');
+        }
+        function syncFeed() {
+            const fresh = pickFeed();
+            if (fresh && fresh !== activeFeed) {
+                /* a hidden feed's iframes keep playing, so park the old
+                   wall's clips before letting it go */
+                for (const t of tiles) { blankFrames(t); t.classList.remove('redx-parked'); t.style.minHeight = ''; }
+                tiles = [];
+                hoverTile = null;
+                selIndex = -1;
+                activeFeed = fresh;
+                stats.feedSwitches = (stats.feedSwitches || 0) + 1;
+            }
+            claimFeed(getFeed());
+        }
+        let feedCheckQueued = false;
+        function queueFeedCheck() {
+            if (feedCheckQueued) return;
+            feedCheckQueued = true;
+            setTimeout(() => { feedCheckQueued = false; if (isOn()) scan(); }, 150);
+        }
+
+        function scan() {
+            syncFeed();
+            watchFeed();
+            if (!lifted.length || lifted.some(el => !el.isConnected)) liftHeader();   // header re-rendered
+            reflow();
+            updateBudget();   // straight away too — never left waiting on an animation frame
+        }
+
+        /* ── post helpers ────────────────────────────────────────── */
+        function getPostUrl(post) {
+            if (!post) return null;
+            const p = post.getAttribute('permalink');
+            if (p && p.length > 1) return p.startsWith('http') ? p : location.origin + p;
+            const ch = post.getAttribute('content-href');
+            if (ch && /\/comments\//.test(ch)) return ch;
+            return post.querySelector('a[href*="/comments/"]')?.href ?? null;
+        }
+
+        /* shadow roots are forced open, so images inside them are reachable */
+        function deepQuery(node, sel, out = [], depth = 0) {
+            if (!node || depth > 5) return out;
+            try { out.push(...node.querySelectorAll(sel)); } catch (_) {}
+            try {
+                for (const el of node.querySelectorAll('*')) {
+                    if (el.shadowRoot) deepQuery(el.shadowRoot, sel, out, depth + 1);
+                }
+            } catch (_) {}
+            return out;
+        }
+
+        /* Reddit's own client-side jump to a post (the pushState guard at
+           the top) opens it the same way a click does */
+        routeToPanel = function (url) {
+            if (!isOn()) return false;
+            openPostUrl(url);
+            return true;
+        };
+
+        /* ── lightbox safety net ─────────────────────────────────── */
+        let lbObs = null;
+        function startLightboxNet() {
+            lbObs = new MutationObserver(muts => {
+                for (const m of muts) for (const n of m.addedNodes) {
+                    if (n.nodeType !== 1) continue;
+                    if (n.tagName === 'SHREDDIT-MEDIA-LIGHTBOX') n.remove();
+                    /* a new feed (sort / page change): move the wall to it */
+                    else if (n.tagName === 'SHREDDIT-FEED' || n.querySelector?.('shreddit-feed')) queueFeedCheck();
+                }
+                /* the wall's feed was taken out */
+                if (activeFeed && !activeFeed.isConnected) queueFeedCheck();
+            });
+            lbObs.observe(document.body, { childList: true, subtree: true });
+        }
+        function stopLightboxNet() { lbObs?.disconnect(); lbObs = null; }
+
+        /* ── activate / deactivate ───────────────────────────────── */
+        let scanTimer = null;
+
+        function activate() {
+            measureLayout();
+            root.classList.add('redx-on');
+            scan();
+            startLightboxNet();
+            scanTimer = setInterval(() => { if (isOn()) scan(); }, SCAN_MS);
+            requestAnimationFrame(() => {
+                const feed = getFeed();
+                if (feed) feed.scrollTop = savedScroll;
+                reflow();
+            });
+        }
+
+        function deactivate() {
+            clearInterval(scanTimer); scanTimer = null;
+            clearTimeout(softTimer); softTimer = null;
+            stopLightboxNet();
+            feedObs?.disconnect(); feedObs = null;
+            observedFeed?.removeEventListener('scroll', scheduleBudget); observedFeed = null;
+            if (budgetRaf) { cancelAnimationFrame(budgetRaf); budgetRaf = 0; }
+            releaseFrames();
+            for (const t of tiles) { t.style.minHeight = ''; t.classList.remove('redx-parked'); }   // grid-only
+            hoverTile = null;
+            if (rec) recStop(false);
+            const feed = getFeed();
+            if (feed) savedScroll = feed.scrollTop;
+            pausePanelMedia();   // the panel hides with the wall; its post stays loaded
+            if (document.activeElement === panelFrame) { panelFrame.blur(); window.focus(); }   // keys back to this page
+            root.classList.remove('redx-on', 'redx-compact');
+            syncShadowSheet(0);
+        }
+
+        window.addEventListener('resize', () => {
+            if (isOn()) measureLayout();   // Reddit's header changes height at its breakpoints
+            queueReflow(true);
+        });
+
+        /* ── click routing (the xrev rules) ───────────────────────── *
+         * window + capture is the earliest point in dispatch, so this
+         * preempts Reddit's own handlers wherever they're attached.
+         * Only plain primary clicks with no text selected are routed;
+         * Ctrl / Shift / middle click keep the browser's new tab.
+         *   • a post's body, title, picture or comment count → the post
+         *   • split mode: r/… and u/… links in a card → the panel
+         *     (popup mode: they still open in this page)
+         *   • votes, share, awards, Join, the … menu, gallery arrows,
+         *     video controls and links to other sites stay Reddit's.   */
+        const SUB_OR_USER = /^\/(?:r|u|user)\/[^/?#]+\/?(?:[?#].*)?$/i;
+        window.addEventListener('click', e => {
+            if (!isOn() || e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+            if (window.getSelection()?.toString()) return;
+
+            const path = e.composedPath();
+            if (path.some(el => el?.classList?.contains?.('redx-ui') || el?.id === 'redx-duplicate')) return;
+            const post = path.find(el => el?.tagName === 'SHREDDIT-POST');
+            if (!post || !getFeed()?.contains(post)) return;          // header, sidebar, a gap
+            const tile = post.closest('article') || post;
+            if (tile.classList?.contains('redx-skip')) return;
+
+            let url = null;
+            for (const el of path) {
+                if (!el || !el.tagName) continue;
+                if (el === post) break;
+
+                /* action bar links are plain <a data-action-bar-action="…"> */
+                const action = el.getAttribute?.('data-action-bar-action');
+                if (action && !/comment/i.test(action)) return;       // vote / share / award
+                if (action) break;                                    // comment count → the post
+
+                if (el.tagName === 'BUTTON' || el.getAttribute?.('role') === 'button') return;
+                if (/^(VIDEO|SHREDDIT-PLAYER|SHREDDIT-PLAYER-2|SHREDDIT-JOIN-BUTTON|SHREDDIT-POST-OVERFLOW-MENU|FACEPLATE-DROPDOWN-MENU)$/.test(el.tagName)) return;
+
+                if (el.tagName === 'A') {
+                    const raw = el.getAttribute('href') || '';
+                    if (!raw || raw.startsWith('#')) continue;
+                    let target;
+                    try { target = new URL(el.href || raw, location.href); } catch (_) { return; }   // as the browser would follow it
+                    if (target.origin !== location.origin) return;           // other sites: Reddit's way
+                    if (/\/comments\//.test(target.pathname)) { url = target.href; break; }
+                    if (SUB_OR_USER.test(target.pathname + target.search)) {
+                        if (openMode !== 'split') return;                   // popup mode: this page navigates
+                        url = target.href;
+                        break;
+                    }
+                    return;                                                 // any other link: Reddit's
+                }
+            }
+
+            url = url || getPostUrl(post);
+            if (!url) return;
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            const i = tiles.indexOf(tile);
+            if (i >= 0) selIndex = i;
+            openPostUrl(url);
+        }, true);
+
+        /* ── keyboard ────────────────────────────────────────────── *
+         * wall key (\): wall off / on — also Alt+G, as in xrev.
+         * panel key (Esc): hide / show the split panel, or close the
+         * popup window. Both editable under the toolbar's "keys".
+         * [ ] − + : columns. m : split ⇄ popup.                       */
+        function wallKey() {
+            if (!pickFeed()) return false;          // no wall on this page to turn on or off
+            setEnabled(!enabled);
+            return true;
+        }
+        function panelKey() {
+            if (!isOn()) return false;
+            if (openMode === 'split') setPanelMin(!panelMin);
+            else if (sideWindow && !sideWindow.closed) closeSideWindow();
+            else return false;
+            return true;
+        }
+        document.addEventListener('keydown', e => {
+            if (recordingKey || typingIn(e)) return;   // Reddit's search lives in shadow DOM; typingIn sees it
+
+            if (e.altKey && !e.ctrlKey && !e.metaKey && (e.code === 'KeyG' || e.key === 'g' || e.key === 'G')) {
+                e.preventDefault(); e.stopImmediatePropagation();
+                wallKey();
+                return;
+            }
+            if (keyIs(e, 'wall') && readKey('wall') !== 'Escape') {
+                if (wallKey()) { e.preventDefault(); e.stopImmediatePropagation(); }
+                return;
+            }
+            if (e.ctrlKey || e.metaKey || e.altKey || !isOn()) return;
+            if (keyIs(e, 'panel')) return;          // handled after Reddit, below
+
+            if (e.key === '[' || e.key === '-') { e.preventDefault(); setCols(shownCols - 1); return; }
+            if (e.key === ']' || e.key === '=' || e.key === '+') { e.preventDefault(); setCols(shownCols + 1); return; }
+            if (e.key === 'm') { e.preventDefault(); setOpenMode(openMode === 'split' ? 'popup' : 'split'); return; }
+        }, true);
+        /* Esc-like keys go last: if Reddit used the press (closing its
+           search or a menu), it isn't also taken as "hide the panel". */
+        window.addEventListener('keydown', e => {
+            if (recordingKey || e.defaultPrevented || typingIn(e)) return;
+            if (keyIs(e, 'wall') && readKey('wall') === 'Escape') { if (wallKey()) e.preventDefault(); return; }
+            if (keyIs(e, 'panel') && panelKey()) e.preventDefault();
+        });
+
+        /* ── on by default: follow the feed as Reddit navigates ───── */
+        updateControls();
+        syncAuto();
+        setInterval(syncAuto, 1000);
+
+    }); // end onReady
+
+})();
